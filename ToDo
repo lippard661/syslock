@@ -1,0 +1,16 @@
+Need a shell script (/bin/sh) which goes into /etc/rc.d and
+will run sysunlock with specific groups if PGP-signed
+appropriately. (unattached signatures?)  (Note: PGP::Sign
+doesn't validate the specific key ID...)
+
+Would also be nice to find a place to run sysunlock prior to library
+reordering (even early daemons are too late); can't really do without
+mods to /etc/rc.
+
+Don't try to remount / unless necessary.
+
+Add -v verbose option.
+
+Parse config more carefully to avoid command line injection--make sure
+paths are really paths, and that they really exist before executing the
+command lines. (Mostly OK as is for directories, but not at all for files.)

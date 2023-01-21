@@ -1,0 +1,243 @@
+#!/usr/bin/perl -w
+# Script to lock/unlock system files by making them immutable.
+# Unlocking must be done as root from single user mode.
+#
+# This code was inspired by code by George Shaffer
+# (http://geodsoft.com/howto/harden/OpenBSD/syslock.txt) but no
+# longer bears much resemblance to it except in its function.
+# ---
+# Written 11 June 2004 by Jim Lippard (version 1.0).
+# Modified 9 November 2006 by Jim Lippard to add do-not-recurse option (version 1.1).
+#    File paths beginning with a + will not have contents of subdirectories locked or
+#    unlocked.
+# Modified 27 December 2011 by Jim Lippard to determine system or user
+#    immutability from syslock.conf and add Linux support.
+# Modified 1 October 2016 by Jim Lippard to add option - which will lock
+#    contents of a directory but not the directory itself.
+# Modified 2 October 2016 by Jim Lippard to add -s singleuser mode and
+#    ! singleuser-unlocked option.
+# Modified 8 October 2016 by Jim Lippard to add -c config option and
+#    -g group option, and group tags for sets of paths.
+# Modified 8 October 2016 by Jim Lippard to complain when bad args are
+#    supplied.
+#
+#    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
+#    is not). File paths without a ! will not be touched when -s is used. This allows you to
+#    put syslock -s in rc.securelevel and do sysunlock -s after rc.shutdown, so that files with ! will
+#    be unlocked when in single user mode. This was added to allow shared object library
+#    reordering, which occurs on boot prior to securelevel change. This means all libraries end up
+#    unlocked in single user mode, unless all other libraries are listed individually, since there's
+#    not currently a way to make an exception within a directory that is otherwise being locked.
+
+### Required packages.
+
+use strict;
+use Getopt::Std;
+
+### Global constants.
+
+my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
+
+my $VERSION = '1.4a of 8 October 2016';
+
+my $LOCK = 0;
+my $UNLOCK = 1;
+
+my $BSD_SYS_IMMUTABLE_FLAG_ON = 'schg';
+my $BSD_USER_IMMUTABLE_FLAG_ON = 'uchg';
+my $LINUX_IMMUTABLE_FLAG_ON = '+i';
+my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
+
+my $MOUNT_COMMAND = '/sbin/mount -uw /';
+my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
+my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
+my $RECURSE_FLAG = '-R';
+my $BSD_SECURELEVEL_COMMAND = '/sbin/sysctl kern.securelevel';
+
+### Global variables.
+
+my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag);
+
+my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag, $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options, $current_group_tags, @file_group_tags, $path);
+
+### Main program.
+
+if ($0 =~ /syslock$/) {
+    $mode = $LOCK;
+}
+elsif ($0 =~ /sysunlock$/) {
+    $mode = $UNLOCK;
+}
+else {
+    die "syslock/sysunlock: I've been invoked under someone else's name: $0\n";
+}
+
+$singleuser_flag = 0;
+$debug_flag = 0;
+$specified_group_tag = 0;
+
+# Get options.
+getopts ('sdc:g:', \%opts) || exit;
+
+if ($#ARGV != -1) {
+    die "Usage: $0 [-s|-d|-c config_file|-g group-tag]\n";
+}
+
+$config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
+$specified_group_tag = $opts{'g'};
+$singleuser_flag = $opts{'s'};
+$debug_flag = $opts{'d'};
+
+print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
+
+$bsd = $linux = 0;
+
+$current_group_tags = 0;
+
+# BSD or Linux?
+if (-e $BSD_LOCK_COMMAND) {
+    $bsd = 1;
+    # Default is system immutability, but this is changeable in config file.
+    $lock_command = $BSD_LOCK_COMMAND;
+    $lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
+    $unlock_flag = "no$lock_flag";
+}
+elsif (-e $LINUX_LOCK_COMMAND) {
+    $linux = 1;
+    $lock_command = $LINUX_LOCK_COMMAND;
+    $lock_flag = $LINUX_IMMUTABLE_FLAG_ON;
+    $unlock_flag = $LINUX_IMMUTABLE_FLAG_OFF;
+}
+else {
+    die "Immutability flags do not appear to be supported by your system.\n";
+}
+
+if ($debug_flag) {
+    $lock_command = '/bin/echo ' . $lock_command;
+}
+
+open (CONFIG, $config_file) || die "Cannot open config file. $config_file\n";
+while (<CONFIG>) {
+    chop; # This causes an error if there is no newline at the end of the config.
+    if (/^\s*$|^\s*#/) { # Comment or blank space.
+    }
+    elsif (/^immutable-flag:\s+(\w+)$/) {
+	if (($1 eq $BSD_SYS_IMMUTABLE_FLAG_ON) ||
+		     ($1 eq $BSD_USER_IMMUTABLE_FLAG_ON)) {
+	    if ($linux) {
+		die "Config file specifies BSD lock flag type but this appears to be a Linux system.\n";
+	    }
+	    $lock_flag = $1;
+	    $unlock_flag = "no$1";
+	}
+	elsif ($1 eq $LINUX_IMMUTABLE_FLAG_ON) {
+	    if ($bsd) {
+		die "Config file specifies Linux lock flag type but this appears to be a Linux system.\n";
+	    }
+	}
+	else {
+	    die "Config file specifies unknown lock flag type \"$1\".\n";
+	}
+    }
+    elsif (/^group:\s+([\w\s\-]+)/) {
+	$current_group_tags = $1;
+	print "DEBUG: current_group_tags = $current_group_tags\n" if ($debug_flag);
+	@new_group_tags = split (/\s+/, $current_group_tags);
+	foreach $group_tag (@new_group_tags) {
+	    if (!grep (/^$group_tag$/, @all_group_tags)) {
+		push (@all_group_tags, $group_tag);
+	    }
+	}
+    }
+    elsif (/^group:/) {
+	die "Invalid characters in \"group:\" tag. $_\n";
+    }
+    elsif (/^([\-\+!])(.*)/) {
+	$options = $1;
+	$path = $2;
+	if ($options =~ /-/) {
+	    $dont_lock_top_level_dir{$path} = 1;
+	    print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
+	}
+	if ($options =~ /\+/) {
+	    $dont_recurse{$path} = 1;
+	    print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
+	}
+	if ($options =~ /!/) {
+	    $singleuser_unlocked{$path} = 1;
+	    print "DEBUG: singleuser_unlocked: $path\n" if ($debug_flag);
+	}
+	push (@files, $path);
+	$group_tags{$path} = $current_group_tags if ($current_group_tags);
+    }
+    else {
+	push (@files, $_);
+	$group_tags{$_} = $current_group_tags if ($current_group_tags);
+    }
+}
+close (CONFIG);
+
+# Make sure specified group tag exists.
+if ($specified_group_tag) {
+    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+    }
+}
+
+# If lock, no securelevel requirement unless -s (singleuser_flag) is given.
+# If unlock, BSD, and using system immutability, securelevel must be < 2.
+if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+    $level = `$BSD_SECURELEVEL_COMMAND`;
+    $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+    if ($mode == $UNLOCK && $level > 1) {
+	die "System securelevel is $level; sysunlock requires securelevel < 2.\n";
+    }
+    elsif ($singleuser_flag && $level > 1) {
+	die "System securelevel is $level; syslock -s requires securelevel < 2.\n";
+    }
+}
+
+# If / happens to be mounted as readonly, make it writeable.
+system "$MOUNT_COMMAND" unless ($debug_flag);
+
+foreach $file (@files) {
+    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag);
+
+    if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
+	(!$specified_group_tag || grep (/^$specified_group_tag$/, @file_group_tags))) {
+	if ($mode == $LOCK) {
+	    if (-d $file) {
+		if ($dont_recurse{$file}) {
+		    system "$lock_command $lock_flag $file/*";
+		    system "$lock_command $lock_flag $file" unless $dont_lock_top_level_dir{$file};
+		}
+		elsif ($dont_lock_top_level_dir{$file}) {
+		    system "$lock_command $RECURSE_FLAG $lock_flag $file/*";
+		}
+		else {
+		    system "$lock_command $RECURSE_FLAG $lock_flag $file";
+		}
+	    }
+	    else {
+		system "$lock_command $lock_flag $file";
+	    }
+	}
+	else {
+	    if (-d $file) {
+		if ($dont_recurse{$file}) {
+		    system "$lock_command $unlock_flag $file" unless $dont_lock_top_level_dir{$file};
+		    system "$lock_command $unlock_flag $file/*";
+		}
+		elsif ($dont_lock_top_level_dir{$file}) {
+		    system "$lock_command $RECURSE_FLAG $unlock_flag $file/*";
+		}
+		else {
+		    system "$lock_command $RECURSE_FLAG $unlock_flag $file";
+		}
+	    }
+	    else {
+		system "$lock_command $unlock_flag $file";
+	    }
+	}
+    }
+}
