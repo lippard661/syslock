@@ -259,7 +259,7 @@ foreach $file (@files) {
 sub _file_warnings {
     my ($path) = @_;
     
-    if ($path !~ /^[\w\-\.\/]+$/) {
+    if ($path !~ /^[\w\-+\.\/]+$/) {
 	print "Warning: Unusual characters in file path in config. \"$path\"\n";
     }
     if (!-e $path) {
