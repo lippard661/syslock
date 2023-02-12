@@ -21,6 +21,10 @@
 # Modified 8 October 2016 by Jim Lippard to complain when bad args are
 #    supplied.
 # Modified 1 February 2023 by Jim Lippard to fix error in error message.
+# Modified 12 February 2023 by Jim Lippard to warn about non-standard
+#    characters in filenames in config and to test for existence of files
+#    and issue warnings (without halting) if they don't exist rather than
+#    trying to lock or unlock nonexistent files.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -39,7 +43,7 @@ use Getopt::Std;
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.4b of 1 February 2023';
+my $VERSION = '1.4c of 12 February 2023';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -156,6 +160,7 @@ while (<CONFIG>) {
     elsif (/^([\-\+!])(.*)/) {
 	$options = $1;
 	$path = $2;
+	&_file_warnings ($path);
 	if ($options =~ /-/) {
 	    $dont_lock_top_level_dir{$path} = 1;
 	    print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
@@ -172,6 +177,7 @@ while (<CONFIG>) {
 	$group_tags{$path} = $current_group_tags if ($current_group_tags);
     }
     else {
+	&_file_warnings ($_);
 	push (@files, $_);
 	$group_tags{$_} = $current_group_tags if ($current_group_tags);
     }
@@ -219,8 +225,11 @@ foreach $file (@files) {
 		    system "$lock_command $RECURSE_FLAG $lock_flag $file";
 		}
 	    }
-	    else {
+	    elsif (-e $file) {
 		system "$lock_command $lock_flag $file";
+	    }
+	    else {
+		print "Not locking. File path in config does not exist. $file\n";
 	    }
 	}
 	else {
@@ -236,9 +245,24 @@ foreach $file (@files) {
 		    system "$lock_command $RECURSE_FLAG $unlock_flag $file";
 		}
 	    }
-	    else {
+	    elsif (-e $file) {
 		system "$lock_command $unlock_flag $file";
 	    }
+	    else {
+		print "Not unlocking. File path in config does not exist. $file\n";
+	    }
 	}
+    }
+}
+
+# Subroutine to warn about unusual characters or nonexistent file paths in config.
+sub _file_warnings {
+    my ($path) = @_;
+    
+    if ($path !~ /^[\w\-\.\/]+$/) {
+	print "Warning: Unusual characters in file path in config. \"$path\"\n";
+    }
+    if (!-e $path) {
+	print "Warning: File path in config does not exist. $path\n";
     }
 }

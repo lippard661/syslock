@@ -5,12 +5,10 @@ doesn't validate the specific key ID...)
 
 Would also be nice to find a place to run sysunlock prior to library
 reordering (even early daemons are too late); can't really do without
-mods to /etc/rc.
+mods to /etc/rc. (Workaround is to use sysunlock -s while in single user
+mode, i.e., after a shutdown, and then put syslock -s into rc.securelevel
+after a long enough sleep for library and kernel reordering to occur.)
 
 Don't try to remount / unless necessary.
 
 Add -v verbose option.
-
-Parse config more carefully to avoid command line injection--make sure
-paths are really paths, and that they really exist before executing the
-command lines. (Mostly OK as is for directories, but not at all for files.)
