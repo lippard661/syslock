@@ -25,6 +25,10 @@
 #    characters in filenames in config and to test for existence of files
 #    and issue warnings (without halting) if they don't exist rather than
 #    trying to lock or unlock nonexistent files.
+# Modified 20 May 2023 by Jim Lippard to only mount / rw if it's mounted
+#    ro and to attempt to determine that on both BSD and Linux (previously
+#    BSD location of mount command was assumed and the mount command was
+#    always issued).
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -43,7 +47,7 @@ use Getopt::Std;
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.4c of 12 February 2023';
+my $VERSION = '1.4d of 20 May 2023';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -53,7 +57,10 @@ my $BSD_USER_IMMUTABLE_FLAG_ON = 'uchg';
 my $LINUX_IMMUTABLE_FLAG_ON = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $MOUNT_COMMAND = '/sbin/mount -uw /';
+my $BSD_MOUNT_COMMAND = '/sbin/mount';
+my $LINUX_MOUNT_COMMAND = '/usr/bin/mount';
+my $BSD_MOUNT_ARGS = '-uw /';
+my $LINUX_MOUNT_ARGS = '-o remount,rw';
 my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
@@ -205,7 +212,14 @@ if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
 }
 
 # If / happens to be mounted as readonly, make it writeable.
-system "$MOUNT_COMMAND" unless ($debug_flag);
+if (&_root_ro) {
+    if ($bsd) {
+	system "$BSD_MOUNT_COMMAND $BSD_MOUNT_ARGS" unless ($debug_flag);
+    }
+    else {
+	system "$LINUX_MOUNT_COMMAND $LINUX_MOUNT_ARGS" unless ($debug_flag);
+    }
+}
 
 foreach $file (@files) {
     @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag);
@@ -265,4 +279,23 @@ sub _file_warnings {
     if (!-e $path) {
 	print "Warning: File path in config does not exist. $path\n";
     }
+}
+
+# Subroutine to determine if / is mounted read-only.
+sub _root_ro {
+    my ($mount_output, $mount_opts_list, @mount_opts);
+
+    if ($bsd) {
+	$mount_output = `$BSD_MOUNT_COMMAND`;
+    }
+    else {
+	$mount_output = `$LINUX_MOUNT_COMMAND`;
+    }
+    if ($mount_output =~ /\/.* on \/ type.*\((.*)\)/) {
+	$mount_opts_list = $1;
+	@mount_opts = split (/,/, $mount_opts_list);
+	return 1 if (grep (/^ro$/, @mount_opts));
+    }
+
+    return 0;
 }
