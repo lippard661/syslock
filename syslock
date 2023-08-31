@@ -29,6 +29,8 @@
 #    ro and to attempt to determine that on both BSD and Linux (previously
 #    BSD location of mount command was assumed and the mount command was
 #    always issued).
+# Modified 30 August 2023 by Jim Lippard to add -v (verbose) flag.
+#    Return / mount to read-only if we changed it.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -47,7 +49,7 @@ use Getopt::Std;
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.4d of 20 May 2023';
+my $VERSION = '1.4e of 30 August 2023';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -60,7 +62,9 @@ my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 my $BSD_MOUNT_COMMAND = '/sbin/mount';
 my $LINUX_MOUNT_COMMAND = '/usr/bin/mount';
 my $BSD_MOUNT_ARGS = '-uw /';
+my $BSD_MOUNT_RO_ARGS = '-u -o ro /';
 my $LINUX_MOUNT_ARGS = '-o remount,rw';
+my $LINUX_MOUNT_RO_ARGS = '-o remount,ro';
 my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
@@ -70,7 +74,7 @@ my $BSD_SECURELEVEL_COMMAND = '/sbin/sysctl kern.securelevel';
 
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag);
 
-my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag, $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options, $current_group_tags, @file_group_tags, $path);
+my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag, $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options, $current_group_tags, @file_group_tags, $path, $verbose_flag, $root_was_ro);
 
 ### Main program.
 
@@ -87,24 +91,28 @@ else {
 $singleuser_flag = 0;
 $debug_flag = 0;
 $specified_group_tag = 0;
+$verbose_flag = 0;
 
 # Get options.
-getopts ('sdc:g:', \%opts) || exit;
+getopts ('sdc:g:v', \%opts) || exit;
 
 if ($#ARGV != -1) {
-    die "Usage: $0 [-s|-d|-c config_file|-g group-tag]\n";
+    die "Usage: $0 [-s|-d|-v|-c config_file|-g group-tag]\n";
 }
 
 $config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
 $specified_group_tag = $opts{'g'};
 $singleuser_flag = $opts{'s'};
 $debug_flag = $opts{'d'};
+$verbose_flag = $opts{'v'};
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
 $bsd = $linux = 0;
 
 $current_group_tags = 0;
+
+$root_was_ro = 0;
 
 # BSD or Linux?
 if (-e $BSD_LOCK_COMMAND) {
@@ -213,6 +221,8 @@ if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
 
 # If / happens to be mounted as readonly, make it writeable.
 if (&_root_ro) {
+    $root_was_ro = 1;
+    print "mounting / as writable\n" if ($verbose_flag);
     if ($bsd) {
 	system "$BSD_MOUNT_COMMAND $BSD_MOUNT_ARGS" unless ($debug_flag);
     }
@@ -227,19 +237,25 @@ foreach $file (@files) {
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
 	(!$specified_group_tag || grep (/^$specified_group_tag$/, @file_group_tags))) {
 	if ($mode == $LOCK) {
+	    print "locking group $specified_group_tag\n" if ($specified_group_tag && $verbose_flag);
 	    if (-d $file) {
 		if ($dont_recurse{$file}) {
+		    print "locking $file/*\n" if ($verbose_flag);
 		    system "$lock_command $lock_flag $file/*";
+		    print "locking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
 		    system "$lock_command $lock_flag $file" unless $dont_lock_top_level_dir{$file};
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
+		    print "recursively locking $file/*\n" if ($verbose_flag);
 		    system "$lock_command $RECURSE_FLAG $lock_flag $file/*";
 		}
 		else {
+		    print "recursively locking $file\n" if ($verbose_flag);
 		    system "$lock_command $RECURSE_FLAG $lock_flag $file";
 		}
 	    }
 	    elsif (-e $file) {
+		print "locking $file\n" if ($verbose_flag);
 		system "$lock_command $lock_flag $file";
 	    }
 	    else {
@@ -247,25 +263,42 @@ foreach $file (@files) {
 	    }
 	}
 	else {
+	    print "unlocking group $specified_group_tag\n" if ($specified_group_tag && $verbose_flag);    
 	    if (-d $file) {
 		if ($dont_recurse{$file}) {
+		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
 		    system "$lock_command $unlock_flag $file" unless $dont_lock_top_level_dir{$file};
+		    print "unlocking $file/*\n" if ($verbose_flag);
 		    system "$lock_command $unlock_flag $file/*";
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
+		    print "recursively unlocking $file/*\n" if ($verbose_flag);
 		    system "$lock_command $RECURSE_FLAG $unlock_flag $file/*";
 		}
 		else {
+		    print "recursively unlocking $file\n" if ($verbose_flag);
 		    system "$lock_command $RECURSE_FLAG $unlock_flag $file";
 		}
 	    }
 	    elsif (-e $file) {
+		print "unlocking $file\n" if ($verbose_flag);
 		system "$lock_command $unlock_flag $file";
 	    }
 	    else {
 		print "Not unlocking. File path in config does not exist. $file\n";
 	    }
 	}
+    }
+}
+
+# If / was mounted as readonly, make it readonly again.
+if ($root_was_ro) {
+    print "mounting / as readonly\n" if ($verbose_flag);
+    if ($bsd) {
+	system "$BSD_MOUNT_COMMAND $BSD_MOUNT_RO_ARGS" unless ($debug_flag);
+    }
+    else {
+	system "$LINUX_MOUNT_COMMAND $LINUX_MOUNT_RO_ARGS" unless ($debug_flag);
     }
 }
 
