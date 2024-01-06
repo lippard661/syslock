@@ -1,3 +1,14 @@
+Add syslock -w (wait) to wait for kernel rebuild/library randomization
+to complete before locking.
+
+Add unveil. Will have to unveil / with r, but then can unveil only the
+directories associated with specified groups, or all dirs represented
+in the config file. The config file should generally be ordered with
+higher, less-specific dirs before deeper ones, so can skip past any
+where the last one unveiled is a substring (but probably not worth it
+to check all previously unveiled). Not sure it is worth doing; have other
+tools using syslock/sysunlock that use unveil.
+
 Need a shell script (/bin/sh) which goes into /etc/rc.d and
 will run sysunlock with specific groups if PGP-signed
 appropriately. (unattached signatures?)  (Note: PGP::Sign
@@ -5,10 +16,9 @@ doesn't validate the specific key ID...)
 
 Would also be nice to find a place to run sysunlock prior to library
 reordering (even early daemons are too late); can't really do without
-mods to /etc/rc. (Workaround is to use sysunlock -s while in single user
-mode, i.e., after a shutdown, and then put syslock -s into rc.securelevel
-after a long enough sleep for library and kernel reordering to occur.)
-
-Don't try to remount / unless necessary.
-
-Add -v verbose option.
+mods to /etc/rc. (Workaround is to use sysunlock -s while in single
+user mode, i.e., after a shutdown, and then put syslock -s into
+rc.securelevel after a long enough sleep for library and kernel
+reordering to occur. This is now even more effective on OpenBSD with
+-w (wait) option; reorder_libs starts before rc.securelevel execution
+and kernel reordering starts a little bit after.)
