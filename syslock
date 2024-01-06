@@ -31,6 +31,10 @@
 #    always issued).
 # Modified 30 August 2023 by Jim Lippard to add -v (verbose) flag.
 #    Return / mount to read-only if we changed it.
+# Modified 5 January 2024 by Jim Lippard to add -w (wait) flag to syslock.
+#    If kernel reordering or library link randomization is in process,
+#    wait for it to complete; for OpenBSD. Add pledge for OpenBSD,
+#    but not bothering with unveil.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -44,12 +48,13 @@
 
 use strict;
 use Getopt::Std;
+use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 ### Global constants.
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.4e of 30 August 2023';
+my $VERSION = '1.5 of 5 January 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -70,19 +75,40 @@ my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
 my $BSD_SECURELEVEL_COMMAND = '/sbin/sysctl kern.securelevel';
 
+my $PS = '/bin/ps';
+my $REORDER_KERNEL = '/usr/libexec/reorder_kernel';
+my $RELINK_DIR = '/usr/share/relink';
+my $REBUILD_PREFIX = '_rebuild';
+my $FIVE_MINUTES = 300;
+
+my $LOCK_OPTIONS = 'sdc:g:vw';
+my $UNLOCK_OPTIONS = 'sdc:g:v';
+
 ### Global variables.
 
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag);
 
-my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag, $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options, $current_group_tags, @file_group_tags, $path, $verbose_flag, $root_was_ro);
+my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
+    $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options,
+    $current_group_tags, @file_group_tags, $path, $verbose_flag,
+    $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
+    $waiting_on_libs, $start_time, $reason);
 
 ### Main program.
 
+# Pledge early, why not?
+if ($^O eq 'openbsd') {
+    # stdio included. do we need ps?
+    pledge ('rpath', 'wpath', 'fattr', 'exec', 'proc');
+}
+
 if ($0 =~ /syslock$/) {
     $mode = $LOCK;
+    $options = $LOCK_OPTIONS;
 }
 elsif ($0 =~ /sysunlock$/) {
     $mode = $UNLOCK;
+    $options = $UNLOCK_OPTIONS;
 }
 else {
     die "syslock/sysunlock: I've been invoked under someone else's name: $0\n";
@@ -92,12 +118,18 @@ $singleuser_flag = 0;
 $debug_flag = 0;
 $specified_group_tag = 0;
 $verbose_flag = 0;
+$wait_flag = 0;
 
 # Get options.
-getopts ('sdc:g:v', \%opts) || exit;
+getopts ($options, \%opts) || exit;
 
 if ($#ARGV != -1) {
-    die "Usage: $0 [-s|-d|-v|-c config_file|-g group-tag]\n";
+    if ($mode == $LOCK) {
+	die "Usage: $0 [-s|-d|-v|-w|-c config_file|-g group-tag]\n";
+    }
+    else {
+	die "Usage: $0 [-s|-d|-v|-c config_file|-g group-tag]\n";
+    }
 }
 
 $config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
@@ -105,6 +137,7 @@ $specified_group_tag = $opts{'g'};
 $singleuser_flag = $opts{'s'};
 $debug_flag = $opts{'d'};
 $verbose_flag = $opts{'v'};
+$wait_flag = $opts{'w'};
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
@@ -131,6 +164,8 @@ elsif (-e $LINUX_LOCK_COMMAND) {
 else {
     die "Immutability flags do not appear to be supported by your system.\n";
 }
+
+die "-w option not supported by your operating system.\n" if ($^O ne 'openbsd');
 
 if ($debug_flag) {
     $lock_command = '/bin/echo ' . $lock_command;
@@ -216,6 +251,35 @@ if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
     }
     elsif ($singleuser_flag && $level > 1) {
 	die "System securelevel is $level; syslock -s requires securelevel < 2.\n";
+    }
+}
+
+# OpenBSD only.
+if ($wait_flag) {
+    $waiting = 1;
+    $start_time = time();
+    while ($waiting) {
+	# check on kernel reordering
+	open (CHECKPS, '-|', "$PS -auwx") || die "Cannot check for kernel reordering. $!\n";
+	$waiting_on_kernel = 0;
+	while (<CHECKPS>) {
+	    if (/$REORDER_KERNEL/) {
+		$waiting_on_kernel = 1;
+		last;
+	    }
+	}
+	close (CHECKPS);
+	# check on library randomization
+	opendir (DIR, $RELINK_DIR) || die "Cannot check for library randomization. $!\n";
+	$waiting_on_libs = grep (/^$REBUILD_PREFIX\.\w+$/, readdir (DIR));
+	closedir (DIR);
+	$waiting = $waiting_on_kernel || $waiting_on_libs;
+	$reason = sprintf "%s%s%s", $waiting_on_kernel ? 'kernel reordering' : '', ($waiting_on_kernel && $waiting_on_libs) ? ' and ' : '', $waiting_on_libs ? 'library randomization' : '';
+	print "Waiting on $reason.\n" if ($verbose_flag);
+	sleep 1 if ($waiting);
+	if (time() - $start_time > $FIVE_MINUTES) {
+	    die "Timeout after five minutes waiting on $reason.\n";
+	}
     }
 }
 
