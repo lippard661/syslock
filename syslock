@@ -35,6 +35,8 @@
 #    If kernel reordering or library link randomization is in process,
 #    wait for it to complete; for OpenBSD. Add pledge for OpenBSD,
 #    but not bothering with unveil.
+# Modified 18 January 2024 by Jim Lippard to remove extraneous \n from $level and
+#    to no longer require that securelevel be <2 for -s given how rc.securelevel works.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -54,7 +56,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.5 of 5 January 2024';
+my $VERSION = '1.5a of 18 January 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -241,16 +243,14 @@ if ($specified_group_tag) {
     }
 }
 
-# If lock, no securelevel requirement unless -s (singleuser_flag) is given.
+# If lock, no securelevel requirement, even if -s (singleuser_flag) is given. (No longer a requirement.)
 # If unlock, BSD, and using system immutability, securelevel must be < 2.
 if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
     $level = `$BSD_SECURELEVEL_COMMAND`;
+    chop ($level);
     $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
     if ($mode == $UNLOCK && $level > 1) {
 	die "System securelevel is $level; sysunlock requires securelevel < 2.\n";
-    }
-    elsif ($singleuser_flag && $level > 1) {
-	die "System securelevel is $level; syslock -s requires securelevel < 2.\n";
     }
 }
 
