@@ -35,8 +35,11 @@
 #    If kernel reordering or library link randomization is in process,
 #    wait for it to complete; for OpenBSD. Add pledge for OpenBSD,
 #    but not bothering with unveil.
-# Modified 18 January 2024 by Jim Lippard to remove extraneous \n from $level and
-#    to no longer require that securelevel be <2 for -s given how rc.securelevel works.
+# Modified 18 January 2024 by Jim Lippard to remove extraneous \n from
+#    $level and to no longer require that securelevel be <2 for -s given
+#    how rc.securelevel works.
+# Modified 13 July 2024 by Jim Lippard to add uchg group, which allows
+#    locking and unlocking files with uchg when schg is the default.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -56,7 +59,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.5a of 18 January 2024';
+my $VERSION = '1.6 of 13 July 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -240,6 +243,12 @@ close (CONFIG);
 if ($specified_group_tag) {
     if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+    }
+
+    # If specified group tag is "uchg", that overrides the config. (BSD only)
+    if ($bsd && $specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON) {
+	$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+	$unlock_flag = "no$BSD_USER_IMMUTABLE_FLAG_ON";
     }
 }
 
