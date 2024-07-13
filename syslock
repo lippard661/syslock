@@ -39,7 +39,8 @@
 #    $level and to no longer require that securelevel be <2 for -s given
 #    how rc.securelevel works.
 # Modified 13 July 2024 by Jim Lippard to add uchg group, which allows
-#    locking and unlocking files with uchg when schg is the default.
+#    locking and unlocking files with uchg when schg is the default. (If
+#    ussing immutable-flag: uchg, it's a no-op.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -94,7 +95,8 @@ my $UNLOCK_OPTIONS = 'sdc:g:v';
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag);
 
 my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
-    $singleuser_flag, $debug_flag, $specified_group_tag, %opts, $options,
+    $singleuser_flag, $uchg_group_flag, $uchg_group_in_use_flag, $debug_flag,
+    $specified_group_tag, %opts, $options,
     $current_group_tags, @file_group_tags, $path, $verbose_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
     $waiting_on_libs, $start_time, $reason);
@@ -122,6 +124,7 @@ else {
 $singleuser_flag = 0;
 $debug_flag = 0;
 $specified_group_tag = 0;
+$uchg_group_flag = 0;
 $verbose_flag = 0;
 $wait_flag = 0;
 
@@ -206,6 +209,7 @@ while (<CONFIG>) {
 	foreach $group_tag (@new_group_tags) {
 	    if (!grep (/^$group_tag$/, @all_group_tags)) {
 		push (@all_group_tags, $group_tag);
+		$uchg_group_flag = 1 if ($group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON);
 	    }
 	}
     }
@@ -304,8 +308,35 @@ if (&_root_ro) {
     }
 }
 
+# If we're already using $BSD_USER_IMMUTABLE_FLAG_ON, then
+# use of uchg groups is a no-op--everything is using uchg.
+$uchg_group_flag = 0 if ($lock_flag eq $BSD_USER_IMMUTABLE_FLAG_ON);
+
+# Initialize uchg_group_in_use_flag if it might be used.
+$uchg_group_in_use_flag = 0 if ($uchg_group_flag);
+
 foreach $file (@files) {
-    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag);
+    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag);
+    my ($temp_lock_flag, $temp_unlock_flag);
+
+    # If file is in uchg group, temporarily change how we lock and unlock.
+    if ($uchg_group_flag && grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	$uchg_group_in_use_flag = 1;
+	# Save current settings.
+	$temp_lock_flag = $lock_flag;
+	$temp_unlock_flag = $unlock_flag;
+	# Use uchg.
+	$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+	$unlock_flag = "no$BSD_USER_IMMUTABLE_FLAG_ON";
+    }
+    # Restore if it's not.
+    elsif ($uchg_group_in_use_flag && grep (!/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	# Restore settings.
+	$uchg_group_in_use_flag = 0;
+	$lock_flag = $temp_lock_flag;
+	$unlock_flag = $temp_unlock_flag;
+    }
+
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
 	(!$specified_group_tag || grep (/^$specified_group_tag$/, @file_group_tags))) {
