@@ -1,5 +1,13 @@
-Add syslock -w (wait) to wait for kernel rebuild/library randomization
-to complete before locking.
+Not really a point for -w to check on lib reordering, which occurs before
+rc.securelevel execution. Might also be better to check every five seconds
+instead of every second. 10 seconds is sufficient sleep time for kernel
+reordering to get started.
+
+(Done.) Permit sysunlock to unlock just uchg portions of other groups, but not
+necessarily all uchg groups, even when not in single-user mode, e.g.,
+with syntax like sysunlock -g configs:uchg or similar. Allow syslock
+to operate in the same way (only locking the uchg portions of the
+configs group).
 
 Add unveil. Will have to unveil / with r, but then can unveil only the
 directories associated with specified groups, or all dirs represented
@@ -12,7 +20,8 @@ tools using syslock/sysunlock that use unveil.
 Need a shell script (/bin/sh) which goes into /etc/rc.d and
 will run sysunlock with specific groups if PGP-signed
 appropriately. (unattached signatures?)  (Note: PGP::Sign
-doesn't validate the specific key ID...)
+doesn't validate the specific key ID... but do this already with
+some signify tools.)
 
 Would also be nice to find a place to run sysunlock prior to library
 reordering (even early daemons are too late); can't really do without

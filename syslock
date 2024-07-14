@@ -40,7 +40,10 @@
 #    how rc.securelevel works.
 # Modified 13 July 2024 by Jim Lippard to add uchg group, which allows
 #    locking and unlocking files with uchg when schg is the default. (If
-#    ussing immutable-flag: uchg, it's a no-op.
+#    ussing immutable-flag: uchg, it's a no-op.)
+# Modified 14 July 2024 by Jim Lippard to allow -g group:uchg, to allow
+#    locking and unlocking files that are in group and are also in uchg
+#    group.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -60,7 +63,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.6 of 13 July 2024';
+my $VERSION = '1.6a of 14 July 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -92,12 +95,14 @@ my $UNLOCK_OPTIONS = 'sdc:g:v';
 
 ### Global variables.
 
-my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag);
+my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
+    @uchg_group_tags);
 
 my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
     $singleuser_flag, $uchg_group_flag, $uchg_group_in_use_flag, $debug_flag,
     $specified_group_tag, %opts, $options,
     $current_group_tags, @file_group_tags, $path, $verbose_flag,
+    $displayed_verbose_group_msg_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
     $waiting_on_libs, $start_time, $reason);
 my ($temp_lock_flag, $temp_unlock_flag);
@@ -207,10 +212,19 @@ while (<CONFIG>) {
 	$current_group_tags = $1;
 	print "DEBUG: current_group_tags = $current_group_tags\n" if ($debug_flag);
 	@new_group_tags = split (/\s+/, $current_group_tags);
+	if ($bsd && grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @new_group_tags)) {
+	    $uchg_group_flag = 1;
+	    $uchg_group_in_use_flag = 1;
+	}
+	else {
+	    $uchg_group_in_use_flag = 0;
+	}
 	foreach $group_tag (@new_group_tags) {
+	    push (@uchg_group_tags, $group_tag) if ($bsd &&
+						    $uchg_group_in_use_flag &&
+						    $group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
 	    if (!grep (/^$group_tag$/, @all_group_tags)) {
 		push (@all_group_tags, $group_tag);
-		$uchg_group_flag = 1 if ($bsd && $group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON);
 	    }
 	}
     }
@@ -245,15 +259,37 @@ while (<CONFIG>) {
 close (CONFIG);
 
 # Make sure specified group tag exists.
+#
+# Two special cases are:
+# groupname:uchg -- only use the subset of groupname that is also in uchg
+#     group. This doesn't verify that the intersection is non-null.
+# uchg -- only do uchg group.
 if ($specified_group_tag) {
-    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
-	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
-    }
+    $displayed_verbose_group_msg_flag = 0 if ($verbose_flag);
+    if ($bsd && $specified_group_tag =~ /^$BSD_USER_IMMUTABLE_FLAG_ON$|^(.*):$BSD_USER_IMMUTABLE_FLAG_ON$/) {
+	if (defined ($1)) {
+	    $specified_group_tag = $1;
+	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    }
+	    elsif (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_IMMUTABLE_FLAG_ON\".\n";
+	    }
+	}
 
-    # If specified group tag is "uchg", that overrides the config. (BSD only)
-    if ($bsd && $specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON) {
-	$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
-	$unlock_flag = "no$lock_flag";
+	# No-op if already using $BSD_USER_IMMUTABLE_FLAG_ON.
+	if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+	    $uchg_group_flag = 1;
+	    $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+	    $unlock_flag = "no$lock_flag";
+	}
+
+	if (!grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+	    die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	}
+    }
+    elsif (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
 
@@ -309,13 +345,6 @@ if (&_root_ro) {
     }
 }
 
-# If we're already using $BSD_USER_IMMUTABLE_FLAG_ON, then
-# use of uchg groups is a no-op--everything is using uchg.
-$uchg_group_flag = 0 if ($lock_flag eq $BSD_USER_IMMUTABLE_FLAG_ON);
-
-# Initialize uchg_group_in_use_flag if it might be used.
-$uchg_group_in_use_flag = 0 if ($uchg_group_flag);
-
 foreach $file (@files) {
     @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag);
 
@@ -337,9 +366,16 @@ foreach $file (@files) {
     }
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
-	(!$specified_group_tag || grep (/^$specified_group_tag$/, @file_group_tags))) {
+	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_flag, @file_group_tags))) {
 	if ($mode == $LOCK) {
-	    print "locking group $specified_group_tag\n" if ($specified_group_tag && $verbose_flag);
+	    if ($specified_group_tag &&
+		$verbose_flag &&
+		!$displayed_verbose_group_msg_flag) {
+		print "locking group $specified_group_tag";
+		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_in_use_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print "\n";
+		$displayed_verbose_group_msg_flag = 1;
+	    }
 	    if (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
@@ -361,11 +397,18 @@ foreach $file (@files) {
 		system "$lock_command $lock_flag $file";
 	    }
 	    else {
-		print "Not locking. File path in config does not exist. $file\n";
+		print "Not locking. File path in config does not exist. $!. $file\n";
 	    }
 	}
 	else {
-	    print "unlocking group $specified_group_tag\n" if ($specified_group_tag && $verbose_flag);    
+	    if ($specified_group_tag &&
+		$verbose_flag &&
+		!$displayed_verbose_group_msg_flag) {
+		print "unlocking group $specified_group_tag";
+		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_in_use_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print "\n";
+		$displayed_verbose_group_msg_flag = 1;
+	    }
 	    if (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
@@ -404,6 +447,24 @@ if ($root_was_ro) {
     }
 }
 
+# Subroutine to return 1 if file is in specified group, 0 otherwise.
+sub _in_group {
+    my ($specified_group_tag, $uchg_group_flag, @file_group_tags) = @_;
+
+    # If it's in the group ...
+    if (grep (/^$specified_group_tag$/, @file_group_tags)) {
+	# and we don't care about uchg...
+	return 1 if (!$uchg_group_flag);
+	# or the specified group is already uchg...
+	return 1 if ($specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON);
+	# or it's also in the uchg group...
+	return 1 if (grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags));
+    }
+
+    # Otherwise.
+    return 0;
+}
+
 # Subroutine to warn about unusual characters or nonexistent file paths in config.
 sub _file_warnings {
     my ($path) = @_;
@@ -412,7 +473,7 @@ sub _file_warnings {
 	print "Warning: Unusual characters in file path in config. \"$path\"\n";
     }
     if (!-e $path) {
-	print "Warning: File path in config does not exist. $path\n";
+	print "Warning: File path in config inaccessible or does not exist. $!. $path\n";
     }
 }
 
