@@ -99,7 +99,8 @@ my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %sing
     @uchg_group_tags);
 
 my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
-    $singleuser_flag, $uchg_group_flag, $uchg_group_in_use_flag, $debug_flag,
+    $singleuser_flag, $uchg_group_flag, $uchg_group_in_use_flag,
+    $uchg_group_specified_flag, $debug_flag,
     $specified_group_tag, %opts, $options,
     $current_group_tags, @file_group_tags, $path, $verbose_flag,
     $displayed_verbose_group_msg_flag,
@@ -148,6 +149,7 @@ if ($#ARGV != -1) {
 
 $config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
 $specified_group_tag = $opts{'g'};
+$uchg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_USER_IMMUTABLE_FLAG_ON$/);
 $singleuser_flag = $opts{'s'};
 $debug_flag = $opts{'d'};
 $verbose_flag = $opts{'v'};
@@ -366,13 +368,13 @@ foreach $file (@files) {
     }
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
-	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_flag, @file_group_tags))) {
+	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_specified_flag, @file_group_tags))) {
 	if ($mode == $LOCK) {
 	    if ($specified_group_tag &&
 		$verbose_flag &&
 		!$displayed_verbose_group_msg_flag) {
 		print "locking group $specified_group_tag";
-		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_in_use_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -405,7 +407,7 @@ foreach $file (@files) {
 		$verbose_flag &&
 		!$displayed_verbose_group_msg_flag) {
 		print "unlocking group $specified_group_tag";
-		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_in_use_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -449,12 +451,12 @@ if ($root_was_ro) {
 
 # Subroutine to return 1 if file is in specified group, 0 otherwise.
 sub _in_group {
-    my ($specified_group_tag, $uchg_group_flag, @file_group_tags) = @_;
+    my ($specified_group_tag, $uchg_group_specified_flag, @file_group_tags) = @_;
 
     # If it's in the group ...
     if (grep (/^$specified_group_tag$/, @file_group_tags)) {
 	# and we don't care about uchg...
-	return 1 if (!$uchg_group_flag);
+	return 1 if (!$uchg_group_specified_flag);
 	# or the specified group is already uchg...
 	return 1 if ($specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON);
 	# or it's also in the uchg group...
