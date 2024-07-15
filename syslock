@@ -275,17 +275,17 @@ if ($specified_group_tag) {
 	    elsif (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_IMMUTABLE_FLAG_ON\".\n";
 	    }
-	}
 
-	# No-op if already using $BSD_USER_IMMUTABLE_FLAG_ON.
-	if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
-	    $uchg_group_flag = 1;
-	    $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
-	    $unlock_flag = "no$lock_flag";
-	}
+	    # No-op if already using $BSD_USER_IMMUTABLE_FLAG_ON.
+	    if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+		$uchg_group_flag = 1;
+		$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+		$unlock_flag = "no$lock_flag";
+	    }
 
-	if (!grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
-	    die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    if (!grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    }
 	}
     }
     elsif (!grep (/^$specified_group_tag$/, @all_group_tags)) {
