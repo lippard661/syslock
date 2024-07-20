@@ -9,6 +9,11 @@ with syntax like sysunlock -g configs:uchg or similar. Allow syslock
 to operate in the same way (only locking the uchg portions of the
 configs group).
 
+(Done.) Do the reverse of the above: schg group/group:schg that is useful when
+the default is uchg. (A little trickier, perhaps.) sysunlock with no
+args when uchg is the default should work but not touch anything in the
+schg group if not in single-user mode.
+
 Add unveil. Will have to unveil / with r, but then can unveil only the
 directories associated with specified groups, or all dirs represented
 in the config file. The config file should generally be ordered with

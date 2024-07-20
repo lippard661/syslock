@@ -36,14 +36,24 @@
 #    wait for it to complete; for OpenBSD. Add pledge for OpenBSD,
 #    but not bothering with unveil.
 # Modified 18 January 2024 by Jim Lippard to remove extraneous \n from
-#    $level and to no longer require that securelevel be <2 for -s given
+#    $level and to no longer require that securelevel be < 1 for -s given
 #    how rc.securelevel works.
 # Modified 13 July 2024 by Jim Lippard to add uchg group, which allows
 #    locking and unlocking files with uchg when schg is the default. (If
-#    ussing immutable-flag: uchg, it's a no-op.)
+#    using immutable-flag: uchg, it's a no-op.)
 # Modified 14 July 2024 by Jim Lippard to allow -g group:uchg, to allow
 #    locking and unlocking files that are in group and are also in uchg
 #    group.
+# Modified 20 July 2024 by Jim Lippard to add schg group and allow
+#    -g group:schg to allow locking and unlocking files that are in
+#    group and also in schg group. (If using immutable-flag: schg,
+#    it's a no-op.) If sysunlock is used without args and system is not
+#    in single-user mode, files in schg group will not be unlocked.
+#    (A warning will be displayed if -v is used, otherwise this will
+#    occur silently.)
+#    Added -f (force) option to force attempt to lock schg files even
+#    if securelevel > 0 (and changed behavior back to not do so by
+#    default).
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -63,7 +73,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.6a of 14 July 2024';
+my $VERSION = '1.7 of 20 July 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -90,22 +100,29 @@ my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
 
-my $LOCK_OPTIONS = 'sdc:g:vw';
+my $LOCK_OPTIONS = 'sdfc:g:vw';
 my $UNLOCK_OPTIONS = 'sdc:g:v';
 
 ### Global variables.
 
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
-    @uchg_group_tags);
+    @uchg_group_tags, @schg_group_tags);
 
 my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
-    $singleuser_flag, $uchg_group_flag, $uchg_group_in_use_flag,
-    $uchg_group_specified_flag, $debug_flag,
+    $singleuser_flag,
+    $uchg_group_flag, # uchg group exists
+    $uchg_group_in_use_flag, # uchg group is used in the section of config or current processing
+    $uchg_group_specified_flag, # -g uchg or -g group:uchg
+    $schg_group_flag, # schg group exists
+    $schg_group_in_use_flag, # schg group is used in the section of config or current processing
+    $schg_group_specified_flag, # -g schg or -g group:schg
+    $debug_flag,
     $specified_group_tag, %opts, $options,
     $current_group_tags, @file_group_tags, $path, $verbose_flag,
     $displayed_verbose_group_msg_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
-    $waiting_on_libs, $start_time, $reason);
+    $waiting_on_libs, $start_time, $reason,
+    $force_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
 
 ### Main program.
@@ -132,15 +149,17 @@ $singleuser_flag = 0;
 $debug_flag = 0;
 $specified_group_tag = 0;
 $uchg_group_flag = 0;
+$schg_group_flag = 0;
 $verbose_flag = 0;
 $wait_flag = 0;
+$force_flag = 0;
 
 # Get options.
 getopts ($options, \%opts) || exit;
 
 if ($#ARGV != -1) {
     if ($mode == $LOCK) {
-	die "Usage: $0 [-s|-d|-v|-w|-c config_file|-g group-tag]\n";
+	die "Usage: $0 [-s|-d|-v|-w|-f|-c config_file|-g group-tag]\n";
     }
     else {
 	die "Usage: $0 [-s|-d|-v|-c config_file|-g group-tag]\n";
@@ -150,10 +169,12 @@ if ($#ARGV != -1) {
 $config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
 $specified_group_tag = $opts{'g'};
 $uchg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_USER_IMMUTABLE_FLAG_ON$/);
+$schg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_SYS_IMMUTABLE_FLAG_ON$/);
 $singleuser_flag = $opts{'s'};
 $debug_flag = $opts{'d'};
 $verbose_flag = $opts{'v'};
 $wait_flag = $opts{'w'};
+$force_flag = $opts{'f'};
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
@@ -221,10 +242,22 @@ while (<CONFIG>) {
 	else {
 	    $uchg_group_in_use_flag = 0;
 	}
+	if ($bsd && grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @new_group_tags)) {
+	    die "Cannot use both $BSD_USER_IMMUTABLE_FLAG_ON and $BSD_SYS_IMMUTABLE_FLAG_ON groups in combination. $_\n" if ($uchg_group_in_use_flag);
+
+	    $schg_group_flag = 1;
+	    $schg_group_in_use_flag = 1;
+	}
+	else {
+	    $schg_group_in_use_flag = 0;
+	}
 	foreach $group_tag (@new_group_tags) {
 	    push (@uchg_group_tags, $group_tag) if ($bsd &&
 						    $uchg_group_in_use_flag &&
 						    $group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+	    push (@schg_group_tags, $group_tag) if ($bsd &&
+						    $schg_group_in_use_flag &&
+						    $group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);
 	    if (!grep (/^$group_tag$/, @all_group_tags)) {
 		push (@all_group_tags, $group_tag);
 	    }
@@ -262,10 +295,14 @@ close (CONFIG);
 
 # Make sure specified group tag exists.
 #
-# Two special cases are:
+# Four special cases are:
 # groupname:uchg -- only use the subset of groupname that is also in uchg
 #     group. This doesn't verify that the intersection is non-null.
 # uchg -- only do uchg group.
+# groupname:schg -- only use the subset of groupname that is also in schg
+#     group. This doesn't verify that the intersection is non-null.
+# schg -- only do schg group.
+# uchg cases:
 if ($specified_group_tag) {
     $displayed_verbose_group_msg_flag = 0 if ($verbose_flag);
     if ($bsd && $specified_group_tag =~ /^$BSD_USER_IMMUTABLE_FLAG_ON$|^(.*):$BSD_USER_IMMUTABLE_FLAG_ON$/) {
@@ -290,20 +327,54 @@ if ($specified_group_tag) {
 	    }
 	}
     }
+    # schg cases:
+    elsif ($bsd && $specified_group_tag =~ /^$BSD_SYS_IMMUTABLE_FLAG_ON$|^(.*):$BSD_SYS_IMMUTABLE_FLAG_ON$/) {
+	if (defined ($1)) {
+	    $specified_group_tag = $1;
+	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    }
+	    elsif (!grep (/^$specified_group_tag$/, @schg_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_IMMUTABLE_FLAG_ON\".\n";
+	    }
+
+	    # No-op if already using $BSD_SYS_IMMUTABLE_FLAG_ON.
+	    if ($lock_flag eq $BSD_USER_IMMUTABLE_FLAG_ON) {
+		$schg_group_flag = 1;
+		$lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
+		$unlock_flag = "no$lock_flag";
+	    }
+
+	    if (!grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    }
+	}
+    }   
     elsif (!grep (/^$specified_group_tag$/, @all_group_tags)) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
 
+# If lock, -f (force) overrides securelevel requirement.
 # If lock, no securelevel requirement, even if -s (singleuser_flag) is given. (No longer a requirement.)
-# If unlock, BSD, and using system immutability, securelevel must be < 2.
+# If unlock, BSD, and using system immutability, securelevel must be < 1.
 if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
     $level = `$BSD_SECURELEVEL_COMMAND`;
     chop ($level);
     $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
-    if ($mode == $UNLOCK && $level > 1) {
-	die "System securelevel is $level; sysunlock requires securelevel < 2.\n";
+    if ($level > 0) {
+	die "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK);
+	die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && !$force_flag);
     }
+}
+# If unlock, BSD, and using user immutability but there are some schg
+# groups in use and securelevel not < 1, warn if verbose.
+elsif ($bsd && $schg_group_flag) {
+    $level = `$BSD_SECURELEVEL_COMMAND`;
+    chop ($level);
+    $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+    print "Warning: System securelevel is $level; sysunlock will not unlock schg groups unless securelevel < 1.\n" if ($verbose_flag && $mode == $UNLOCK && $level > 0);
+    print "Warning: System securelevel is $level; syslock will not lock schg groups unless -f option is used or securelevel < 1.\n" if ($verbose_flag && !$force_flag && $mode == $LOCK && $level > 0);
 }
 
 # OpenBSD only.
@@ -348,8 +419,9 @@ if (&_root_ro) {
 }
 
 foreach $file (@files) {
-    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag);
+    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag);
 
+    # uchg group is in config
     if ($uchg_group_flag) {
 	# If file is in uchg group, temporarily change how we lock and unlock.
 	if (grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
@@ -366,15 +438,38 @@ foreach $file (@files) {
 	    $unlock_flag = "no$lock_flag";
 	}
     }
+    # Not an elsif. Can have both groups in use. schg group is in config.
+    # We've already verified no config groups have both schg and uchg,
+    # which would make this go awry.
+    if ($schg_group_flag) {
+	# If file is in uchg group, temporarily change how we lock and unlock.
+	# If file is in schg group, we're unlocking, and secure level not < 1,
+	# then skip it.
+	if (grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	    next if ((!$force_flag || $mode == $UNLOCK) && $level > 0);
+	    $schg_group_in_use_flag = 1;
+	    # Use schg.
+	    $lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
+	    $unlock_flag = "no$lock_flag";
+	}
+	# Restore if it's not.
+	elsif ($schg_group_in_use_flag && grep (!/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	    # Use uchg.
+	    $schg_group_in_use_flag = 0;
+	    $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+	    $unlock_flag = "no$lock_flag";
+	}
+    }
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
-	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_specified_flag, @file_group_tags))) {
+	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, @file_group_tags))) {
 	if ($mode == $LOCK) {
 	    if ($specified_group_tag &&
 		$verbose_flag &&
 		!$displayed_verbose_group_msg_flag) {
 		print "locking group $specified_group_tag";
 		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print ":$BSD_SYS_IMMUTABLE_FLAG_ON" if ($schg_group_specified_flag && $specified_group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);		
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -408,6 +503,7 @@ foreach $file (@files) {
 		!$displayed_verbose_group_msg_flag) {
 		print "unlocking group $specified_group_tag";
 		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+		print ":$BSD_SYS_IMMUTABLE_FLAG_ON" if ($schg_group_specified_flag && $specified_group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);	
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -451,16 +547,25 @@ if ($root_was_ro) {
 
 # Subroutine to return 1 if file is in specified group, 0 otherwise.
 sub _in_group {
-    my ($specified_group_tag, $uchg_group_specified_flag, @file_group_tags) = @_;
+    my ($specified_group_tag,
+	$uchg_group_specified_flag,
+	$schg_group_specified_flag,
+	@file_group_tags) = @_;
 
     # If it's in the group ...
     if (grep (/^$specified_group_tag$/, @file_group_tags)) {
-	# and we don't care about uchg...
-	return 1 if (!$uchg_group_specified_flag);
-	# or the specified group is already uchg...
-	return 1 if ($specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON);
-	# or it's also in the uchg group...
-	return 1 if (grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags));
+	# and we don't care about uchg or schg...
+	return 1 if (!$uchg_group_specified_flag && $schg_group_specified_flag);
+	# or the specified group is already uchg/schg...
+	return 1 if (($uchg_group_specified_flag &&
+		      $specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON) ||
+		     ($schg_group_specified_flag &&
+		      $specified_group_tag eq $BSD_SYS_IMMUTABLE_FLAG_ON));
+	# or it's also in the uchg/schg group...
+	return 1 if (($uchg_group_specified_flag &&
+		      grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) ||
+		     ($schg_group_specified_flag &&
+		      grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)));
     }
 
     # Otherwise.
