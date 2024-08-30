@@ -37,7 +37,7 @@
 #    but not bothering with unveil.
 # Modified 18 January 2024 by Jim Lippard to remove extraneous \n from
 #    $level and to no longer require that securelevel be < 1 for -s given
-#    how rc.securelevel works.
+#    how rc.securelevel works. [Reverted latter with -f, must now use -swf.]
 # Modified 13 July 2024 by Jim Lippard to add uchg group, which allows
 #    locking and unlocking files with uchg when schg is the default. (If
 #    using immutable-flag: uchg, it's a no-op.)
@@ -54,6 +54,12 @@
 #    Added -f (force) option to force attempt to lock schg files even
 #    if securelevel > 0 (and changed behavior back to not do so by
 #    default).
+# Modified 29 August 2024 by Jim Lippard to add error checking on pledge.
+# Modified 30 August 2024 by Jim Lippard to add -a (audit) option, which
+#    makes no changes but simply reports divergences from the configuration
+#    (or parts thereof based on -g options). Ignores system securelevel
+#    limitations. With syslock, tells what is still unlocked; with sysunlock,
+#    tells what is still locked.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -73,7 +79,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.7 of 20 July 2024';
+my $VERSION = '1.8 of 30 August 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -94,14 +100,15 @@ my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
 my $BSD_SECURELEVEL_COMMAND = '/sbin/sysctl kern.securelevel';
 
+my $ECHO = '/bin/echo';
 my $PS = '/bin/ps';
 my $REORDER_KERNEL = '/usr/libexec/reorder_kernel';
 my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
 
-my $LOCK_OPTIONS = 'sdfc:g:vw';
-my $UNLOCK_OPTIONS = 'sdc:g:v';
+my $LOCK_OPTIONS = 'asdfc:g:vw';
+my $UNLOCK_OPTIONS = 'asdc:g:v';
 
 ### Global variables.
 
@@ -122,7 +129,7 @@ my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
     $displayed_verbose_group_msg_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
     $waiting_on_libs, $start_time, $reason,
-    $force_flag);
+    $force_flag, $audit_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
 
 ### Main program.
@@ -130,7 +137,7 @@ my ($temp_lock_flag, $temp_unlock_flag);
 # Pledge early, why not?
 if ($^O eq 'openbsd') {
     # stdio included. do we need ps?
-    pledge ('rpath', 'wpath', 'fattr', 'exec', 'proc');
+    pledge ('rpath', 'wpath', 'fattr', 'exec', 'proc') || die "Cannot pledge promises. $!\n";
 }
 
 if ($0 =~ /syslock$/) {
@@ -153,16 +160,17 @@ $schg_group_flag = 0;
 $verbose_flag = 0;
 $wait_flag = 0;
 $force_flag = 0;
+$audit_flag = 0;
 
 # Get options.
 getopts ($options, \%opts) || exit;
 
 if ($#ARGV != -1) {
     if ($mode == $LOCK) {
-	die "Usage: $0 [-s|-d|-v|-w|-f|-c config_file|-g group-tag]\n";
+	die "Usage: $0 [-s|-d|-v|-w|-f|-a|-c config_file|-g group-tag]\n";
     }
     else {
-	die "Usage: $0 [-s|-d|-v|-c config_file|-g group-tag]\n";
+	die "Usage: $0 [-s|-d|-v|-a|-c config_file|-g group-tag]\n";
     }
 }
 
@@ -175,6 +183,11 @@ $debug_flag = $opts{'d'};
 $verbose_flag = $opts{'v'};
 $wait_flag = $opts{'w'};
 $force_flag = $opts{'f'};
+$audit_flag = $opts{'a'};
+
+die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
+die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
+die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
@@ -205,9 +218,10 @@ else {
 die "-w option not supported by your operating system.\n" if ($^O ne 'openbsd');
 
 if ($debug_flag) {
-    $lock_command = '/bin/echo ' . $lock_command;
+    $lock_command = $ECHO . ' '.  $lock_command;
 }
 
+print "DEBUG: opening config file\n" if ($debug_flag);
 open (CONFIG, $config_file) || die "Cannot open config file. $config_file\n";
 while (<CONFIG>) {
     chop; # This causes an error if there is no newline at the end of the config.
@@ -292,6 +306,7 @@ while (<CONFIG>) {
     }
 }
 close (CONFIG);
+print "DEBUG: closing config file\n" if ($debug_flag);
 
 # Make sure specified group tag exists.
 #
@@ -358,13 +373,16 @@ if ($specified_group_tag) {
 # If lock, -f (force) overrides securelevel requirement.
 # If lock, no securelevel requirement, even if -s (singleuser_flag) is given. (No longer a requirement.)
 # If unlock, BSD, and using system immutability, securelevel must be < 1.
+# Don't die if -a (audit), but warn.
 if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
     $level = `$BSD_SECURELEVEL_COMMAND`;
     chop ($level);
     $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
     if ($level > 0) {
-	die "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK);
-	die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && !$force_flag);
+	die "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK && !$audit_flag);
+	print "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK && $audit_flag);
+	die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && !$force_flag && !$audit_flag);
+	print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && $audit_flag);
     }
 }
 # If unlock, BSD, and using user immutability but there are some schg
@@ -407,7 +425,7 @@ if ($wait_flag) {
 }
 
 # If / happens to be mounted as readonly, make it writeable.
-if (&_root_ro) {
+if (!$audit_flag && &_root_ro) {
     $root_was_ro = 1;
     print "mounting / as writable\n" if ($verbose_flag);
     if ($bsd) {
@@ -473,7 +491,11 @@ foreach $file (@files) {
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
-	    if (-d $file) {
+	    if ($audit_flag) {
+		# Report on what is unlocked that would be locked by command.
+		&_audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+	    }
+	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
 		    system "$lock_command $lock_flag $file/*";
@@ -494,7 +516,7 @@ foreach $file (@files) {
 		system "$lock_command $lock_flag $file";
 	    }
 	    else {
-		print "Not locking. File path in config does not exist. $!. $file\n";
+		print "Not locking. File path in config inaccessible or does not exist. $!. $file\n";
 	    }
 	}
 	else {
@@ -507,7 +529,11 @@ foreach $file (@files) {
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
-	    if (-d $file) {
+	    if ($audit_flag) {
+		# Report on what is locked that would be unlocked by command.
+		&_audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+	    }
+	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
 		    system "$lock_command $unlock_flag $file" unless $dont_lock_top_level_dir{$file};
@@ -528,7 +554,7 @@ foreach $file (@files) {
 		system "$lock_command $unlock_flag $file";
 	    }
 	    else {
-		print "Not unlocking. File path in config does not exist. $file\n";
+		print "Not unlocking. File path in config inaccessible or does not exist. $!. $file\n";
 	    }
 	}
     }
@@ -601,4 +627,100 @@ sub _root_ro {
     }
 
     return 0;
+}
+
+# Subroutine to compare actual to desired flags.
+sub _desired_flag_mismatch {
+    my ($file, $desired_flag, $other_flag) = @_;
+    my ($flags, $perms, $nlinks, $uid, $gid);
+
+    if ($bsd) {
+	my $LSFLAGS = '/bin/ls -lod';
+	$LSFLAGS = '/bin/ls -lOd' if ($^O eq 'darwin');
+        $flags = `$LSFLAGS \Q$file\E`;
+        ($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
+	if ($desired_flag =~ /^no(.*$)/) {
+	    return 0 if ($flags eq '-');
+	}
+	else {
+	    return 0 if ($flags eq $desired_flag);
+	}
+	return $flags;
+    }
+    else {
+	my $LSFLAGS = '/bin/lsattr';
+	$flags = `$LSFLAGS \Q$file\E`;
+	($flags) = split (/\s+/, $flags);
+	return 0 if ($desired_flag =~ /\+i/ && $flags =~ /i/);
+	return 0 if ($desired_flag =~ /-i/ && $flags =~ /^\-+$/);
+	$flags =~ s/^-+$/-/;
+	return $flags;
+    }
+}
+
+# Subroutine to report on what's not in the intended state.
+# (This currently only looks at the specific flag for BSD, schg/uchg,
+# and will call it "unlocked" if it's only locked with the one not checked.)
+sub _audit_file {
+    my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $recurse_level) = @_;
+    my ($flags, $desired_state, @subfiles, $subfile, $printed_something, $spaces);
+
+    if ($desired_flag =~ /^no(.*)$/) {
+	$desired_state = 'unlocked';
+    }
+    elsif ($desired_flag eq '-i') {
+	$desired_state = 'unlocked';
+    }
+    elsif ($desired_flag eq '+i') {
+	$desired_state = 'locked';
+    }
+    else {
+	$desired_state = 'locked with ' . $desired_flag;
+    }
+
+    $recurse_level = 0 if (!defined ($recurse_level));
+
+    $printed_something = 0;
+    $spaces = $recurse_level * 3;
+
+    if (-d $file) {
+	# We care about the dir itself.
+	if (!$dont_lock_top_level_dir_flag) {
+	    if ($flags = &_desired_flag_mismatch ($file, $desired_flag)) {
+		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n";
+		$printed_something = 1;
+	    }
+	}
+	# Check subdir contents.
+	opendir (DIR, $file) || die "Cannot open directory. $!. $file\n";
+	@subfiles = grep (!/^\.{1,2}$/, readdir (DIR));
+	closedir (DIR);
+
+	foreach $subfile (@subfiles) {
+	    # If we need to recurse.
+	    if (-d "$file/$subfile" && !$dont_recurse_flag) {
+		$recurse_level++;
+		&_audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
+		$recurse_level--;
+	    }
+	    elsif ($flags = &_desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
+		if (!$printed_something) {
+		    print ' 'x$spaces, "In $file/:\n";
+		    $printed_something = 1;
+		}
+		print ' 'x$spaces, "   $subfile (should be $desired_state, flags=$flags)\n";
+
+	    }
+	}
+    }
+    # If a file, just audit the file.
+    elsif (-e $file) {
+	if ($flags = &_desired_flag_mismatch ($file, $desired_flag)) {
+	    print "$file (should be $desired_state, flags=$flags)\n";
+	}
+    }
+    # If nonexistent, just report that.
+    else {
+	print "File path in config inaccessible or does not exist. $!. $file\n";
+    }
 }
