@@ -60,6 +60,9 @@
 #    (or parts thereof based on -g options). Ignores system securelevel
 #    limitations. With syslock, tells what is still unlocked; with sysunlock,
 #    tells what is still locked.
+# Modified 31 August 2024 by Jim Lippard to fix some dumb Linux bugs,
+#    including failing to use lsattr -d to get directory immutable flags
+#    instead of listing of flags on directory contents.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -79,7 +82,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.8 of 30 August 2024';
+my $VERSION = '1.8a of 1 September 2024';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -188,6 +191,7 @@ $audit_flag = $opts{'a'};
 die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
 die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
 die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
+die "-w option not supported by your operating system.\n" if ($wait_flag && $^O ne 'openbsd');
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
@@ -206,16 +210,17 @@ if (-e $BSD_LOCK_COMMAND) {
     $unlock_flag = "no$lock_flag";
 }
 elsif (-e $LINUX_LOCK_COMMAND) {
+    if ($ENV{'USER'} ne 'root') {
+	die "Must be run as root.\n";
+    }
     $linux = 1;
-    $lock_command = $LINUX_LOCK_COMMAND;
+    $lock_command = "$LINUX_LOCK_COMMAND -f";
     $lock_flag = $LINUX_IMMUTABLE_FLAG_ON;
     $unlock_flag = $LINUX_IMMUTABLE_FLAG_OFF;
 }
 else {
     die "Immutability flags do not appear to be supported by your system.\n";
 }
-
-die "-w option not supported by your operating system.\n" if ($^O ne 'openbsd');
 
 if ($debug_flag) {
     $lock_command = $ECHO . ' '.  $lock_command;
@@ -608,6 +613,9 @@ sub _file_warnings {
     if (!-e $path) {
 	print "Warning: File path in config inaccessible or does not exist. $!. $path\n";
     }
+    if ($linux && -l $path) {
+	print "Warning: File path in config is a symlink. $path\n";
+    }
 }
 
 # Subroutine to determine if / is mounted read-only.
@@ -648,12 +656,13 @@ sub _desired_flag_mismatch {
 	return $flags;
     }
     else {
-	my $LSFLAGS = '/bin/lsattr';
+	my $LSFLAGS = '/usr/bin/lsattr -d';
 	$flags = `$LSFLAGS \Q$file\E`;
 	($flags) = split (/\s+/, $flags);
 	return 0 if ($desired_flag =~ /\+i/ && $flags =~ /i/);
 	return 0 if ($desired_flag =~ /-i/ && $flags =~ /^\-+$/);
 	$flags =~ s/^-+$/-/;
+	$flags =~ s/-//g if ($flags ne '-');
 	return $flags;
     }
 }
@@ -683,7 +692,10 @@ sub _audit_file {
     $printed_something = 0;
     $spaces = $recurse_level * 3;
 
-    if (-d $file) {
+    if ($linux && -l $file) {
+	print "Warning: ignoring symlink. $file\n";
+    }
+    elsif (-d $file) {
 	# We care about the dir itself.
 	if (!$dont_lock_top_level_dir_flag) {
 	    if ($flags = &_desired_flag_mismatch ($file, $desired_flag)) {
@@ -697,8 +709,12 @@ sub _audit_file {
 	closedir (DIR);
 
 	foreach $subfile (@subfiles) {
+	    if ($linux && -l "$file/$subfile") {
+		# Ignore links.
+		next;
+	    }
 	    # If we need to recurse.
-	    if (-d "$file/$subfile" && !$dont_recurse_flag) {
+	    elsif (-d "$file/$subfile" && !$dont_recurse_flag) {
 		$recurse_level++;
 		&_audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
 		$recurse_level--;

@@ -15,6 +15,8 @@ Can be used with -g to check a subset of the config. (Also already have
 -d debug option that shows what would be done without doing it, but that
 doesn't check current state.)
 
+* Made Linux-oriented config (linux.syslock.conf).
+
 Notes/Pointers:
 
 * Would be nice to find a place to run sysunlock prior to library
@@ -48,6 +50,8 @@ maybe not, since exec/system calls have new pledge and unveil settings
 and don't carry them over from the parent).
 
 To Do:
+
+Make macOS-oriented config (supports BSD flags).
 
 Allow using globs in config file (e.g., /etc/hostname.*)?  Currently
 generates warning and will refuse to lock/unlock due to failing
