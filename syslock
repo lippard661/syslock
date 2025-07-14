@@ -63,6 +63,13 @@
 # Modified 31 August 2024 by Jim Lippard to fix some dumb Linux bugs,
 #    including failing to use lsattr -d to get directory immutable flags
 #    instead of listing of flags on directory contents.
+# Modified 28 November 2024 by Jim Lippard to reverse order of lib randomization
+#    and kernel reordering checks.
+# Modified 14 July 2025 by Jim Lippard to reject config file paths containing
+#    shell metacharacters and to execute system calls without shell except
+#    when needed (ideally would do my its own recursion), both related to
+#    potential unsanitized input in config file that could be used for
+#    command injection--but the config should only be writable by root.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -82,7 +89,7 @@ use if $^O eq "openbsd", "OpenBSD::Pledge";
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.8a of 1 September 2024';
+my $VERSION = '1.9 of 14 July 2025';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -94,10 +101,10 @@ my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
 my $BSD_MOUNT_COMMAND = '/sbin/mount';
 my $LINUX_MOUNT_COMMAND = '/usr/bin/mount';
-my $BSD_MOUNT_ARGS = '-uw /';
-my $BSD_MOUNT_RO_ARGS = '-u -o ro /';
-my $LINUX_MOUNT_ARGS = '-o remount,rw';
-my $LINUX_MOUNT_RO_ARGS = '-o remount,ro';
+my @BSD_MOUNT_ARGS = ('-uw', '/');
+my @BSD_MOUNT_RO_ARGS = ('-u', '-o', 'ro', '/');
+my @LINUX_MOUNT_ARGS = ('-o', 'remount,rw');
+my @LINUX_MOUNT_RO_ARGS = ('-o', 'remount,ro');
 my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
@@ -118,7 +125,7 @@ my $UNLOCK_OPTIONS = 'asdc:g:v';
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
     @uchg_group_tags, @schg_group_tags);
 
-my ($config_file, $bsd, $linux, $lock_command, $lock_flag, $unlock_flag,
+my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $singleuser_flag,
     $uchg_group_flag, # uchg group exists
     $uchg_group_in_use_flag, # uchg group is used in the section of config or current processing
@@ -205,7 +212,7 @@ $root_was_ro = 0;
 if (-e $BSD_LOCK_COMMAND) {
     $bsd = 1;
     # Default is system immutability, but this is changeable in config file.
-    $lock_command = $BSD_LOCK_COMMAND;
+    @lock_command = ($BSD_LOCK_COMMAND);
     $lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
     $unlock_flag = "no$lock_flag";
 }
@@ -214,7 +221,7 @@ elsif (-e $LINUX_LOCK_COMMAND) {
 	die "Must be run as root.\n";
     }
     $linux = 1;
-    $lock_command = "$LINUX_LOCK_COMMAND -f";
+    @lock_command = ($LINUX_LOCK_COMMAND, '-f');
     $lock_flag = $LINUX_IMMUTABLE_FLAG_ON;
     $unlock_flag = $LINUX_IMMUTABLE_FLAG_OFF;
 }
@@ -223,7 +230,7 @@ else {
 }
 
 if ($debug_flag) {
-    $lock_command = $ECHO . ' '.  $lock_command;
+    unshift (@lock_command, $ECHO);
 }
 
 print "DEBUG: opening config file\n" if ($debug_flag);
@@ -405,7 +412,12 @@ if ($wait_flag) {
     $waiting = 1;
     $start_time = time();
     while ($waiting) {
-	# check on kernel reordering
+	# check on library randomization (unlikely to ever be useful since rc.securelevel runs after this is done)
+	opendir (DIR, $RELINK_DIR) || die "Cannot check for library randomization. $!\n";
+	$waiting_on_libs = grep (/^$REBUILD_PREFIX\.\w+$/, readdir (DIR));
+	closedir (DIR);
+
+	# check on kernel reordering (assumes syslock runs after kernel reordering has begun)
 	open (CHECKPS, '-|', "$PS -auwx") || die "Cannot check for kernel reordering. $!\n";
 	$waiting_on_kernel = 0;
 	while (<CHECKPS>) {
@@ -415,10 +427,7 @@ if ($wait_flag) {
 	    }
 	}
 	close (CHECKPS);
-	# check on library randomization
-	opendir (DIR, $RELINK_DIR) || die "Cannot check for library randomization. $!\n";
-	$waiting_on_libs = grep (/^$REBUILD_PREFIX\.\w+$/, readdir (DIR));
-	closedir (DIR);
+
 	$waiting = $waiting_on_kernel || $waiting_on_libs;
 	$reason = sprintf "%s%s%s", $waiting_on_kernel ? 'kernel reordering' : '', ($waiting_on_kernel && $waiting_on_libs) ? ' and ' : '', $waiting_on_libs ? 'library randomization' : '';
 	print "Waiting on $reason.\n" if ($verbose_flag);
@@ -434,10 +443,10 @@ if (!$audit_flag && &_root_ro) {
     $root_was_ro = 1;
     print "mounting / as writable\n" if ($verbose_flag);
     if ($bsd) {
-	system "$BSD_MOUNT_COMMAND $BSD_MOUNT_ARGS" unless ($debug_flag);
+	system ($BSD_MOUNT_COMMAND, @BSD_MOUNT_ARGS) unless ($debug_flag);
     }
     else {
-	system "$LINUX_MOUNT_COMMAND $LINUX_MOUNT_ARGS" unless ($debug_flag);
+	system ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_ARGS) unless ($debug_flag);
     }
 }
 
@@ -503,22 +512,22 @@ foreach $file (@files) {
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
-		    system "$lock_command $lock_flag $file/*";
+		    system ("@lock_command $lock_flag $file/*");
 		    print "locking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
-		    system "$lock_command $lock_flag $file" unless $dont_lock_top_level_dir{$file};
+		    system (@lock_command, $lock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively locking $file/*\n" if ($verbose_flag);
-		    system "$lock_command $RECURSE_FLAG $lock_flag $file/*";
+		    system ("@lock_command $RECURSE_FLAG $lock_flag $file/*");
 		}
 		else {
 		    print "recursively locking $file\n" if ($verbose_flag);
-		    system "$lock_command $RECURSE_FLAG $lock_flag $file";
+		    system (@lock_command, $RECURSE_FLAG, $lock_flag, $file);
 		}
 	    }
 	    elsif (-e $file) {
 		print "locking $file\n" if ($verbose_flag);
-		system "$lock_command $lock_flag $file";
+		system (@lock_command, $lock_flag, $file);
 	    }
 	    else {
 		print "Not locking. File path in config inaccessible or does not exist. $!. $file\n";
@@ -541,22 +550,22 @@ foreach $file (@files) {
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
-		    system "$lock_command $unlock_flag $file" unless $dont_lock_top_level_dir{$file};
+		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		    print "unlocking $file/*\n" if ($verbose_flag);
-		    system "$lock_command $unlock_flag $file/*";
+		    system ("@lock_command $unlock_flag $file/*");
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively unlocking $file/*\n" if ($verbose_flag);
-		    system "$lock_command $RECURSE_FLAG $unlock_flag $file/*";
+		    system ("@lock_command $RECURSE_FLAG $unlock_flag $file/*");
 		}
 		else {
 		    print "recursively unlocking $file\n" if ($verbose_flag);
-		    system "$lock_command $RECURSE_FLAG $unlock_flag $file";
+		    system (@lock_command, $RECURSE_FLAG, $unlock_flag, $file);
 		}
 	    }
 	    elsif (-e $file) {
 		print "unlocking $file\n" if ($verbose_flag);
-		system "$lock_command $unlock_flag $file";
+		system (@lock_command, $unlock_flag, $file);
 	    }
 	    else {
 		print "Not unlocking. File path in config inaccessible or does not exist. $!. $file\n";
@@ -569,10 +578,10 @@ foreach $file (@files) {
 if ($root_was_ro) {
     print "mounting / as readonly\n" if ($verbose_flag);
     if ($bsd) {
-	system "$BSD_MOUNT_COMMAND $BSD_MOUNT_RO_ARGS" unless ($debug_flag);
+	system ($BSD_MOUNT_COMMAND, @BSD_MOUNT_RO_ARGS) unless ($debug_flag);
     }
     else {
-	system "$LINUX_MOUNT_COMMAND $LINUX_MOUNT_RO_ARGS" unless ($debug_flag);
+	system ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_RO_ARGS) unless ($debug_flag);
     }
 }
 
@@ -608,6 +617,7 @@ sub _file_warnings {
     my ($path) = @_;
     
     if ($path !~ /^[\w\-+\.\/]+$/) {
+	die "File path in config contains shell metacharacters. \"$path\"\n" if ($path =~ /[;\|\$\'\"><!&\*\[\]\^\?]/);
 	print "Warning: Unusual characters in file path in config. \"$path\"\n";
     }
     if (!-e $path) {

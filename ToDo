@@ -1,5 +1,7 @@
 Done:
 
+* Added ! for /usr/bin (needed for relinking of ssh-agent with OpenBSD 7.6)
+
 * Permit sysunlock to unlock only the uchg portions of other groups, but
 not necessarily all uchg groups, even when not in single-user mode. Allow
 syslock to operate in the same way (only locking the uchg portions of the
@@ -33,7 +35,9 @@ now is -swf.
 rc.securelevel execution, which is where it's recommended to be used, so
 it's not really a useful check.  It might be better for -w to check every
 five seconds instead of every second; 10 seconds is sufficient sleep time
-for kernel reordering to get started.
+for kernel reordering to get started. (Recently found case where 10 seconds
+was insufficient and syslock ran before kernel reordering started, thus
+causing kernel reordering to fail; 45 seconds was more than sufficient.)
 
 * Hard links between directories with different settings (i.e., some uchg,
 some schg) can lead to both flags being applied, which can cause issues.
@@ -57,11 +61,16 @@ Allow using globs in config file (e.g., /etc/hostname.*)?  Currently
 generates warning and will refuse to lock/unlock due to failing
 existence test. (This creates a potential root immutable file bypass
 without console access on reboot via interfaces where there is no
-hostname.<int> file.)
+hostname.<int> file.) (Currently disallow * and other shell metachars
+in file paths.)
 
-Need a shell script (/bin/sh) which goes into /etc/rc.d and
-will run sysunlock with specific groups if PGP-signed
-appropriately. (unattached signatures?)  (Note: PGP::Sign
-doesn't validate the specific key ID... but do this already with
-some signify tools.) [What was the point of this again? For installing
-updates? Not currently seeing good reason for this.]
+Need a shell script (/bin/sh) which goes into /etc/rc.d and will run
+sysunlock with specific groups if PGP-signed
+appropriately. (unattached signatures?)  (Note: PGP::Sign doesn't
+validate the specific key ID... but do this already with some signify
+tools.) [What was the point of this again? For installing updates? Not
+currently seeing good reason for this.] (This has been implemented in
+my distribute/install scripts; distribute config file specifies
+whether specific syslock groups need to be unlocked and signs the list
+with a signify key, install reads the list, checks the sigs, and does
+the unlocking.)
