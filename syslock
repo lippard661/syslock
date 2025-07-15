@@ -70,6 +70,8 @@
 #    when needed (ideally would do my its own recursion), both related to
 #    potential unsanitized input in config file that could be used for
 #    command injection--but the config should only be writable by root.
+# Modified 14 July 2025 by Jim Lippard with suggestions from ChatGPT 4o to
+#    tighten up security slightly more.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -84,6 +86,12 @@
 use strict;
 use Getopt::Std;
 use if $^O eq "openbsd", "OpenBSD::Pledge";
+
+### Sanitize environment.
+BEGIN {
+    $ENV{PATH} = '/usr/bin:/bin';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+}
 
 ### Global constants.
 
@@ -236,7 +244,7 @@ if ($debug_flag) {
 print "DEBUG: opening config file\n" if ($debug_flag);
 open (CONFIG, $config_file) || die "Cannot open config file. $config_file\n";
 while (<CONFIG>) {
-    chop; # This causes an error if there is no newline at the end of the config.
+    chomp;
     if (/^\s*$|^\s*#/) { # Comment or blank space.
     }
     elsif (/^immutable-flag:\s+(\w+)$/) {
@@ -512,13 +520,18 @@ foreach $file (@files) {
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
-		    system ("@lock_command $lock_flag $file/*");
+		    foreach my $entry (glob("$file/*")) {
+			next unless -e $entry;
+			system (@lock_command, $lock_flag, $entry);
+		    }
 		    print "locking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
 		    system (@lock_command, $lock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively locking $file/*\n" if ($verbose_flag);
-		    system ("@lock_command $RECURSE_FLAG $lock_flag $file/*");
+		    foreach my $entry (glob("$file/*")) {
+			_recurse_lock_or_unlock ($entry, $lock_flag);
+		    }
 		}
 		else {
 		    print "recursively locking $file\n" if ($verbose_flag);
@@ -552,11 +565,16 @@ foreach $file (@files) {
 		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
 		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		    print "unlocking $file/*\n" if ($verbose_flag);
-		    system ("@lock_command $unlock_flag $file/*");
+		    foreach my $entry (glob("$file/*")) {
+			next unless -e $entry;
+			system (@lock_command, $unlock_flag, $entry);
+		    }
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively unlocking $file/*\n" if ($verbose_flag);
-		    system ("@lock_command $RECURSE_FLAG $unlock_flag $file/*");
+		    foreach my $entry (glob("$file/*")) {
+			_recurse_lock_or_unlock ($entry, $lock_flag);
+		    }
 		}
 		else {
 		    print "recursively unlocking $file\n" if ($verbose_flag);
@@ -674,6 +692,22 @@ sub _desired_flag_mismatch {
 	$flags =~ s/^-+$/-/;
 	$flags =~ s/-//g if ($flags ne '-');
 	return $flags;
+    }
+}
+
+# Subroutine to recursively lock or unlock files in subdirectories.
+sub _recurse_lock_or_unlock {
+    my ($path, $flag) = @_;
+    return if -l $path; # skip symlinks
+    if (-d $path) {
+	opendir (my $dh, $path) or return;
+	my @entries = grep(!/^\.$|^\.\.$/, readdir($dh));
+	closedir ($dh);
+	_recurse_lock_or_unlock ("$path/$_", $flag) for @entries;
+	system (@lock_command, $flag, $path);
+    }
+    elsif (-e $path) {
+	system (@lock_command, $flag, $path);
     }
 }
 
