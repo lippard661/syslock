@@ -1,5 +1,14 @@
 Done:
 
+* Change behavior as follows:
+If immutable-flag is schg and system securelevel is > 0, sysunlock should warn but
+proceed to unlock all uchg group files. Still error if individual groups are specified
+that have no uchg groups.  syslock should warn that -f is required for schg groups but
+proceed to lock all uchg groups (with -v).  This mirrors immutable-flag: uchg behavior:
+If immutable flag is uchg and system securelevel is > 0, sysunlock warns if there are
+any schg groups with -v. syslock warns if there are schg groups with -v, and requires -f
+to lock them.
+
 * Added ! for /usr/bin (needed for relinking of ssh-agent with OpenBSD 7.6)
 
 * Permit sysunlock to unlock only the uchg portions of other groups, but
@@ -22,6 +31,10 @@ doesn't check current state.)
 * Made macOS-oriented config (macos.syslock.conf).
 
 Notes/Pointers:
+
+* On macOS with Apple silicon, there is no single-user mode and "schg"
+has become equivalent to "uchg" (no single-user requirement to unset
+the flag).
 
 * Would be nice to find a place to run sysunlock prior to library
 reordering (even early daemons are too late); can't really do without

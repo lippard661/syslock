@@ -72,6 +72,11 @@
 #    command injection--but the config should only be writable by root.
 # Modified 14 July 2025 by Jim Lippard with suggestions from ChatGPT 4o to
 #    tighten up security slightly more.
+# Modified 2 August 2025 by Jim Lippard to make it work more similarly
+#    for immutable-flag: schg regarding uchg groups as it works for
+#    schg groups with immutable-flag: uchg -- when securelevel > 0,
+#    implicitly just handle uchg groups, with requisite warnings if -v
+#    is used and locking the schg files only with -f.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -97,7 +102,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.9 of 14 July 2025';
+my $VERSION = '1.10 of 2 August 2025';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -285,6 +290,12 @@ while (<CONFIG>) {
 	else {
 	    $schg_group_in_use_flag = 0;
 	}
+	# Prepend implicit tag for immutable flag.
+	if ($bsd && !$schg_group_in_use_flag && !$uchg_group_in_use_flag) {
+	    $current_group_tags = $lock_flag . ' ' . $current_group_tags;
+	    $schg_group_in_use_flag = 1 if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON);
+	    $uchg_group_in_use_flag = 1 if ($lock_flag eq $BSD_USER_IMMUTABLE_FLAG_ON);
+	}
 	foreach $group_tag (@new_group_tags) {
 	    push (@uchg_group_tags, $group_tag) if ($bsd &&
 						    $uchg_group_in_use_flag &&
@@ -337,6 +348,7 @@ print "DEBUG: closing config file\n" if ($debug_flag);
 # groupname:schg -- only use the subset of groupname that is also in schg
 #     group. This doesn't verify that the intersection is non-null.
 # schg -- only do schg group.
+#
 # uchg cases:
 if ($specified_group_tag) {
     $displayed_verbose_group_msg_flag = 0 if ($verbose_flag);
@@ -357,7 +369,8 @@ if ($specified_group_tag) {
 		$unlock_flag = "no$lock_flag";
 	    }
 
-	    if (!grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+	    # Must be at least one group using $BSD_USER_IMMUTABLE_FLAG_ON (if they aren't already all implicit).
+	    if ($lock_flag ne $BSD_USER_IMMUTABLE_FLAG_ON && !grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	}
@@ -380,7 +393,8 @@ if ($specified_group_tag) {
 		$unlock_flag = "no$lock_flag";
 	    }
 
-	    if (!grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+	    # Must be at least one group with $BSD_SYS_IMMUTABLE_FLAG_ON (if they aren't already all implicit).
+	    if ($lock_flag ne $BSD_SYS_IMMUTABLE_FLAG_ON && !grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	}
@@ -390,29 +404,87 @@ if ($specified_group_tag) {
     }
 }
 
-# If lock, -f (force) overrides securelevel requirement.
-# If lock, no securelevel requirement, even if -s (singleuser_flag) is given. (No longer a requirement.)
-# If unlock, BSD, and using system immutability, securelevel must be < 1.
-# Don't die if -a (audit), but warn.
-if ($bsd && $lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+# Get system security level if BSD, using BSD_SYS_IMMUTABLE_FLAG_ON, or
+# there are schg groups.
+if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
+	     $schg_group_flag)) {
     $level = `$BSD_SECURELEVEL_COMMAND`;
     chop ($level);
     $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+
+    # Warnings and errors.
     if ($level > 0) {
-	die "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK && !$audit_flag);
-	print "System securelevel is $level; sysunlock requires securelevel < 1.\n" if ($mode == $UNLOCK && $audit_flag);
-	die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && !$force_flag && !$audit_flag);
-	print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" if ($mode == $LOCK && $audit_flag);
+	# For $BSD_SYS_IMMUTABLE_FLAG_ON:
+	# If lock, -f (force) overrides securelevel requirement.
+	#    If uchg groups in use, they will be locked.
+	# If unlock, securelevel must be < 1.
+	#    If uchg groups in use, they will be unlocked.
+	# Don't die if -a (audit), but warn.
+	# Also die if schg group was explicitly specified.
+	if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+	    print "DEBUG: uchg_group_flag=$uchg_group_flag\n" if ($debug_flag);
+	    if ($mode == $LOCK) {
+		if ((!$force_flag && !$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$force_flag)) {
+		    die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
+		}
+		elsif ($audit_flag) {
+		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
+		}
+		# Implicit uchg group specified.
+		elsif ($uchg_group_flag && !$force_flag) {
+		    $schg_group_flag = 1; # necessary to skip schg files
+		    
+		    if (!$specified_group_tag) {
+			$specified_group_tag = $BSD_USER_IMMUTABLE_FLAG_ON;
+		    }
+		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
+			# Can't implicitly add :uchg if there's no such group.
+			if (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n";
+			}
+#			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON
+		    }
+
+		    # Here to avoid duplicate in case where above die error occurs.
+		    print "System securelevel is $level; syslock requires -f option or securelevel < 1. Locking uchg group only\n" if ($verbose_flag);
+		}
+	    }
+	    else { # mode == UNLOCK
+		if ((!$audit_flag && !$uchg_group_flag) || $schg_group_specified_flag) {
+		    die "System securelevel is $level; sysunlock requires securelevel < 1.\n";
+		}
+		elsif ($audit_flag) {
+		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n";
+		}
+		# Implicit uchg group specified.
+		elsif ($uchg_group_flag) {
+		    $schg_group_flag = 1; # necessary to skip schg files
+		    
+		    if (!$specified_group_tag) {
+			$specified_group_tag = $BSD_USER_IMMUTABLE_FLAG_ON;
+		    }
+		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
+			# Can't implicitly add :uchg if there's no such group.
+			if (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n";
+			}
+
+#			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON;
+		    }
+
+		    # Here to avoid duplicate in case where above die error occurs.
+		    print "System securelevel is $level; sysunlock requires securelevel < 1. Unlocking uchg group only.\n" if ($verbose_flag);
+		}
+	    }
+	}
+	# For $BSD_USER_IMMUTABLE_FLAG_ON:
+	# If unlock, BSD, and using user immutability but there are some schg
+	# groups in use and securelevel not < 1, warn if verbose. [Shouldn't this work conversely for system immutability and some uchg?]
+	elsif ($schg_group_flag) {
+	    print "Warning: System securelevel is $level; sysunlock will not unlock schg groups unless securelevel < 1.\n" if ($verbose_flag && $mode == $UNLOCK && $level > 0);
+	    print "Warning: System securelevel is $level; syslock will not lock schg groups unless -f option is used or securelevel < 1.\n" if ($verbose_flag && !$force_flag && $mode == $LOCK && $level > 0);
+	}
     }
-}
-# If unlock, BSD, and using user immutability but there are some schg
-# groups in use and securelevel not < 1, warn if verbose.
-elsif ($bsd && $schg_group_flag) {
-    $level = `$BSD_SECURELEVEL_COMMAND`;
-    chop ($level);
-    $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
-    print "Warning: System securelevel is $level; sysunlock will not unlock schg groups unless securelevel < 1.\n" if ($verbose_flag && $mode == $UNLOCK && $level > 0);
-    print "Warning: System securelevel is $level; syslock will not lock schg groups unless -f option is used or securelevel < 1.\n" if ($verbose_flag && !$force_flag && $mode == $LOCK && $level > 0);
 }
 
 # OpenBSD only.
@@ -520,6 +592,7 @@ foreach $file (@files) {
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
 			next unless -e $entry;
 			system (@lock_command, $lock_flag, $entry);
@@ -529,17 +602,20 @@ foreach $file (@files) {
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively locking $file/*\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
 			_recurse_lock_or_unlock ($entry, $lock_flag);
 		    }
 		}
 		else {
 		    print "recursively locking $file\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    system (@lock_command, $RECURSE_FLAG, $lock_flag, $file);
 		}
 	    }
 	    elsif (-e $file) {
 		print "locking $file\n" if ($verbose_flag);
+		print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		system (@lock_command, $lock_flag, $file);
 	    }
 	    else {
@@ -562,9 +638,11 @@ foreach $file (@files) {
 	    }
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
-		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});		    
+		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		    print "unlocking $file/*\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
 			next unless -e $entry;
 			system (@lock_command, $unlock_flag, $entry);
@@ -572,17 +650,20 @@ foreach $file (@files) {
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively unlocking $file/*\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
 			_recurse_lock_or_unlock ($entry, $lock_flag);
 		    }
 		}
 		else {
 		    print "recursively unlocking $file\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    system (@lock_command, $RECURSE_FLAG, $unlock_flag, $file);
 		}
 	    }
 	    elsif (-e $file) {
 		print "unlocking $file\n" if ($verbose_flag);
+		print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		system (@lock_command, $unlock_flag, $file);
 	    }
 	    else {
