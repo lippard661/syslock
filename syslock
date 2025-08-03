@@ -77,6 +77,10 @@
 #    schg groups with immutable-flag: uchg -- when securelevel > 0,
 #    implicitly just handle uchg groups, with requisite warnings if -v
 #    is used and locking the schg files only with -f.
+# Modified 3 August 2025 by Jim Lippard to make uchg the default for
+#    macOS, since schg is now equivalent to uchg and there is no single-user
+#    mode on Apple Silicon. Apple uses an alternative "restricted" flag
+#    for Apple binaries.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -102,7 +106,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.10 of 2 August 2025';
+my $VERSION = '1.10a of 3 August 2025';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -224,10 +228,19 @@ $root_was_ro = 0;
 # BSD or Linux?
 if (-e $BSD_LOCK_COMMAND) {
     $bsd = 1;
-    # Default is system immutability, but this is changeable in config file.
     @lock_command = ($BSD_LOCK_COMMAND);
-    $lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
-    $unlock_flag = "no$lock_flag";
+    # Default is user immutability for macOS (no single-user mode
+    # on Apple Silicon).
+    if ($^O eq 'darwin') {
+	$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+	$unlock_flag = "no$lock_flag";
+    }
+    # Otherwise BSD default is system immutability, but this is changeable
+    # in config file.
+    else {
+	$lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
+	$unlock_flag = "no$lock_flag";
+    }
 }
 elsif (-e $LINUX_LOCK_COMMAND) {
     if ($ENV{'USER'} ne 'root') {
