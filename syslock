@@ -81,6 +81,9 @@
 #    macOS, since schg is now equivalent to uchg and there is no single-user
 #    mode on Apple Silicon. Apple uses an alternative "restricted" flag
 #    for Apple binaries.
+# Modified 14 September 2025 by Jim Lippard to ignore special character
+#    files and files mounted on non-standard filesystems in addition to
+#    symlinks when checking for flags on files on Linux.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
 #    is not). File paths without a ! will not be touched when -s is used. This allows you to
@@ -106,7 +109,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.10a of 3 August 2025';
+my $VERSION = '1.10b of 14 September 2025';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -134,8 +137,8 @@ my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
 
-my $LOCK_OPTIONS = 'asdfc:g:vw';
-my $UNLOCK_OPTIONS = 'asdc:g:v';
+my $LOCK_OPTIONS = 'asdfc:g:vwV';
+my $UNLOCK_OPTIONS = 'asdc:g:vV';
 
 ### Global variables.
 
@@ -194,10 +197,10 @@ getopts ($options, \%opts) || exit;
 
 if ($#ARGV != -1) {
     if ($mode == $LOCK) {
-	die "Usage: $0 [-s|-d|-v|-w|-f|-a|-c config_file|-g group-tag]\n";
+	die "Usage: $0 [-s|-d|-v|-w|-f|-a|-V|-c config_file|-g group-tag]\n";
     }
     else {
-	die "Usage: $0 [-s|-d|-v|-a|-c config_file|-g group-tag]\n";
+	die "Usage: $0 [-s|-d|-v|-a|-V|-c config_file|-g group-tag]\n";
     }
 }
 
@@ -216,6 +219,22 @@ die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
 die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
 die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
 die "-w option not supported by your operating system.\n" if ($wait_flag && $^O ne 'openbsd');
+
+die "Cannot use -V (version) with other options.\n" if ($opts{'V'} &&
+							($singleuser_flag ||
+							 $debug_flag ||
+							 $verbose_flag ||
+							 $wait_flag ||
+							 $force_flag ||
+							 $audit_flag ||
+							 $specified_group_tag ||
+							 $opts{'c'}));
+
+# -V (version).
+if ($opts{'V'}) {
+    print "$VERSION\n";
+    exit;
+}
 
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
@@ -759,6 +778,23 @@ sub _root_ro {
     return 0;
 }
 
+# Subroutine to tell if a file is on a fuse or msdos filesystem (where
+# Linux lsattr won't work). (This code from sigtree.pl with slight
+# modification.))
+sub _on_nonstd_fs {
+    my ($file) = @_;
+    my $fs_type;
+
+    my $STAT = '/usr/bin/stat';
+
+    $fs_type = `$STAT -f -c %T \Q$file\E`;
+    chomp ($fs_type);
+    return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
+		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
+		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
+#    return 1 if ($fs_type ne 'ext2/ext3');
+}
+
 # Subroutine to compare actual to desired flags.
 sub _desired_flag_mismatch {
     my ($file, $desired_flag, $other_flag) = @_;
@@ -830,8 +866,10 @@ sub _audit_file {
     $printed_something = 0;
     $spaces = $recurse_level * 3;
 
-    if ($linux && -l $file) {
-	print "Warning: ignoring symlink. $file\n";
+    if ($linux && ((-l $file) || (-c $file) || (&_on_nonstd_fs ($file)))) {
+	print "Warning: ignoring symlink. $file\n" if (-l $file);
+	print "Warning: ignoring special character file. $file\n" if (-c $file);
+	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (&_on_nonstd_fs ($file));
     }
     elsif (-d $file) {
 	# We care about the dir itself.
@@ -847,8 +885,11 @@ sub _audit_file {
 	closedir (DIR);
 
 	foreach $subfile (@subfiles) {
-	    if ($linux && -l "$file/$subfile") {
-		# Ignore links.
+	    if ($linux && ((-l "$file/$subfile") ||
+		(-c "$file/$subfile") ||
+		(&_on_nonstd_fs ("$file/$subfile")))) {
+		# Ignore links, special character files, and files on
+		# non-standard mounted filesystems.
 		next;
 	    }
 	    # If we need to recurse.
