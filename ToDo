@@ -1,5 +1,11 @@
 Done:
 
+* Additional cleanup: removed glob, backticks, added taint
+checking, better path validation, unveil on OpenBSD to limit
+executables, check config file permissions.
+
+Done:
+
 * Change behavior as follows:
 If immutable-flag is schg and system securelevel is > 0, sysunlock should warn but
 proceed to unlock all uchg group files. Still error if individual groups are specified

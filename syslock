@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl -wT
 # Script to lock/unlock system files by making them immutable.
 # Unlocking must be done as root from single user mode.
 #
@@ -84,20 +84,29 @@
 # Modified 14 September 2025 by Jim Lippard to ignore special character
 #    files and files mounted on non-standard filesystems in addition to
 #    symlinks when checking for flags on files on Linux.
+# Modified 4 January 2026 by Jim Lippard to remove & on subroutine calls.
+# Modified 31 January 2026 by Jim Lippard to add taint checking, better
+#    config file checks for path validation and config file permissions,
+#    use unveil on OpenBSD to prevent file executions, eliminate use of
+#    glob and backticks.
 #
-#    File paths beginning with a ! will be locked or unlocked when -s is used (as well as when it
-#    is not). File paths without a ! will not be touched when -s is used. This allows you to
-#    put syslock -s in rc.securelevel and do sysunlock -s after rc.shutdown, so that files with ! will
-#    be unlocked when in single user mode. This was added to allow shared object library
-#    reordering, which occurs on boot prior to securelevel change. This means all libraries end up
-#    unlocked in single user mode, unless all other libraries are listed individually, since there's
-#    not currently a way to make an exception within a directory that is otherwise being locked.
+#    File paths beginning with a ! will be locked or unlocked when -s
+#    is used (as well as when it is not). File paths without a ! will
+#    not be touched when -s is used. This allows you to put syslock -s
+#    in rc.securelevel and do sysunlock -s after rc.shutdown, so that
+#    files with ! will be unlocked when in single user mode. This was
+#    added to allow shared object library reordering, which occurs on
+#    boot prior to securelevel change. This means all libraries end up
+#    unlocked in single user mode, unless all other libraries are
+#    listed individually, since there's not currently a way to make an
+#    exception within a directory that is otherwise being locked.
 
 ### Required packages.
 
 use strict;
 use Getopt::Std;
-use if $^O eq "openbsd", "OpenBSD::Pledge";
+use if $^O eq 'openbsd', 'OpenBSD::Pledge';
+use if $^O eq 'openbsd', 'OpenBSD::Unveil';
 
 ### Sanitize environment.
 BEGIN {
@@ -128,7 +137,8 @@ my @LINUX_MOUNT_RO_ARGS = ('-o', 'remount,ro');
 my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
-my $BSD_SECURELEVEL_COMMAND = '/sbin/sysctl kern.securelevel';
+my $SYSCTL = '/sbin/sysctl';
+my $BSD_SECURELEVEL_COMMAND = "$SYSCTL kern.securelevel";
 
 my $ECHO = '/bin/echo';
 my $PS = '/bin/ps';
@@ -139,6 +149,12 @@ my $FIVE_MINUTES = 300;
 
 my $LOCK_OPTIONS = 'asdfc:g:vwV';
 my $UNLOCK_OPTIONS = 'asdc:g:vV';
+
+use constant {
+    PERMS_WORLD_WRITABLE => 0002,
+    PERMS_GROUP_WRITABLE => 0020,
+    UID_ROOT => 0,
+};
 
 ### Global variables.
 
@@ -163,12 +179,6 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
 my ($temp_lock_flag, $temp_unlock_flag);
 
 ### Main program.
-
-# Pledge early, why not?
-if ($^O eq 'openbsd') {
-    # stdio included. do we need ps?
-    pledge ('rpath', 'wpath', 'fattr', 'exec', 'proc') || die "Cannot pledge promises. $!\n";
-}
 
 if ($0 =~ /syslock$/) {
     $mode = $LOCK;
@@ -236,6 +246,32 @@ if ($opts{'V'}) {
     exit;
 }
 
+# Pledge and unveil.
+if ($^O eq 'openbsd') {
+    unveil ($config_file, 'r') || die "Cannot unveil config file. $!\n";
+    unveil ($BSD_LOCK_COMMAND, 'rx') || die "Cannot unveil BSD lock command (chflags). $!\n";
+    my $LS = '/bin/ls';
+    unveil ($LS, 'x') || die "Cannot unveil ls. $!\n";
+    unveil ($BSD_MOUNT_COMMAND, 'x') || die "Cannot unveil BSD mount command. $!\n";
+    unveil ($SYSCTL, 'x') || die "Cannot unveil sysctl. $!\n";
+    if ($debug_flag) {
+	unveil ($ECHO, 'x') || die "Cannot unveil echo. $!\n";
+    }
+
+    if ($wait_flag) {
+	unveil ($PS, 'x') || die "Cannot unveil ps. $!\n";
+	unveil ($REORDER_KERNEL, 'x') || die "Cannot unveil reorder_kernel. $!\n";
+	unveil ($RELINK_DIR, 'r') || die "Cannot unveil relink dir. $!\n";
+    }
+    
+    unveil ('/', 'rw') || die "Cannot unveil /. $!\n";
+    unveil () || die "Cannot lock unveil. $!\n";
+    
+    # stdio included. do we need ps? nope.
+    my @promises = ('rpath', 'wpath', 'fattr', 'exec', 'proc');
+    pledge (@promises) || die "Cannot pledge promises. $!\n";
+}
+
 print "singleuser_flag = 1\n" if ($debug_flag && $singleuser_flag);
 
 $bsd = $linux = 0;
@@ -278,8 +314,28 @@ if ($debug_flag) {
     unshift (@lock_command, $ECHO);
 }
 
+# Verify config file is root-owned and not world-writable
+my @stat = stat ($config_file);
+if (!@stat) {
+    die "Cannot stat config file $config_file: $!\n";
+}
+
+my ($file_mode, $uid) = @stat[2, 4];
+
+if ($uid != UID_ROOT) {
+    die "Config file $config_file must be owned by root (currently uid $uid)\n";
+}
+
+if ($file_mode & PERMS_WORLD_WRITABLE) {  # World-writable
+    die "Config file $config_file must not be world-writable\n";
+}
+
+if ($file_mode & PERMS_GROUP_WRITABLE) {  # Group-writable
+    warn "Warning: Config file $config_file is group-writable\n";
+}
+
 print "DEBUG: opening config file\n" if ($debug_flag);
-open (CONFIG, $config_file) || die "Cannot open config file. $config_file\n";
+open (CONFIG, '<', $config_file) || die "Cannot open config file. $config_file\n";
 while (<CONFIG>) {
     chomp;
     if (/^\s*$|^\s*#/) { # Comment or blank space.
@@ -346,7 +402,8 @@ while (<CONFIG>) {
     elsif (/^([\-\+!])(.*)/) {
 	$options = $1;
 	$path = $2;
-	&_file_warnings ($path);
+	$path = _file_warnings ($path); # get untainted path back
+	
 	if ($options =~ /-/) {
 	    $dont_lock_top_level_dir{$path} = 1;
 	    print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
@@ -363,9 +420,9 @@ while (<CONFIG>) {
 	$group_tags{$path} = $current_group_tags if ($current_group_tags);
     }
     else {
-	&_file_warnings ($_);
-	push (@files, $_);
-	$group_tags{$_} = $current_group_tags if ($current_group_tags);
+	$path = _file_warnings ($_);
+	push (@files, $path);
+	$group_tags{$path} = $current_group_tags if ($current_group_tags);
     }
 }
 close (CONFIG);
@@ -440,8 +497,11 @@ if ($specified_group_tag) {
 # there are schg groups.
 if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 	     $schg_group_flag)) {
-    $level = `$BSD_SECURELEVEL_COMMAND`;
-    chop ($level);
+    my @sysctl_command = split (/\s+/, $BSD_SECURELEVEL_COMMAND);
+    open (my $sysctl_fh, '-|', @sysctl_command) or die "Could not run sysctl. $!\n";
+    $level = <$sysctl_fh>;
+    close ($sysctl_fh);
+    chomp ($level);
     $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
 
     # Warnings and errors.
@@ -551,7 +611,7 @@ if ($wait_flag) {
 }
 
 # If / happens to be mounted as readonly, make it writeable.
-if (!$audit_flag && &_root_ro) {
+if (!$audit_flag && _root_ro()) {
     $root_was_ro = 1;
     print "mounting / as writable\n" if ($verbose_flag);
     if ($bsd) {
@@ -606,7 +666,7 @@ foreach $file (@files) {
     }
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
-	(!$specified_group_tag || &_in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, @file_group_tags))) {
+	(!$specified_group_tag || _in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, @file_group_tags))) {
 	if ($mode == $LOCK) {
 	    if ($specified_group_tag &&
 		$verbose_flag &&
@@ -619,13 +679,16 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is unlocked that would be locked by command.
-		&_audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		_audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
 	    }
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    foreach my $entry (glob("$file/*")) {
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
 			next unless -e $entry;
 			system (@lock_command, $lock_flag, $entry);
 		    }
@@ -635,7 +698,10 @@ foreach $file (@files) {
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively locking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    foreach my $entry (glob("$file/*")) {
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
 			_recurse_lock_or_unlock ($entry, $lock_flag);
 		    }
 		}
@@ -666,7 +732,7 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is locked that would be unlocked by command.
-		&_audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		_audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
 	    }
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
@@ -743,32 +809,57 @@ sub _in_group {
     return 0;
 }
 
-# Subroutine to warn about unusual characters or nonexistent file paths in config.
+# Subroutine to warn about unusual characters or nonexistent file paths in config
+# and to untaint the result.
 sub _file_warnings {
     my ($path) = @_;
     
-    if ($path !~ /^[\w\-+\.\/]+$/) {
-	die "File path in config contains shell metacharacters. \"$path\"\n" if ($path =~ /[;\|\$\'\"><!&\*\[\]\^\?]/);
-	print "Warning: Unusual characters in file path in config. \"$path\"\n";
+    if ($path =~ /[;&|`\$\(\)<>]/) {
+        die "Shell metacharacters in config file path not allowed. $path\n";
     }
-    if (!-e $path) {
-	print "Warning: File path in config inaccessible or does not exist. $!. $path\n";
+    # Reject paths that aren't absolute
+    if ($path !~ m{^/}) {
+        die "Only absolute paths allowed in config file. $path\n";
     }
-    if ($linux && -l $path) {
-	print "Warning: File path in config is a symlink. $path\n";
+    # Reject directory traversal.
+    if ($path =~ /\.\./) {
+        die "Path traversal (..) not allowed in config file. $path\n";
     }
+    # Reject null bytes.
+    if ($path =~ /\0/) {
+        die "Null bytes not allowed in config file path. $path\n";
+    }
+
+    # Untaint path.
+    my $clean_path;
+    if ($path =~ m{^([-\w./+]+)$}) {
+        $clean_path = $1;  # Untainted
+    }
+    else {
+        die "Path contains unsafe characters after validation. $path\n";
+    }
+
+    # Ensure existence.
+    if (!-e $clean_path) {
+	print "Warning: File path in config inaccessible or does not exist. $!. $clean_path\n";
+    }
+    # Warn about symlinks.
+    if ($linux && -l $clean_path) {
+	print "Warning: File path in config is a symlink. $clean_path\n";
+    }
+
+    return $clean_path;
 }
 
 # Subroutine to determine if / is mounted read-only.
 sub _root_ro {
     my ($mount_output, $mount_opts_list, @mount_opts);
+    my $mount_cmd = $bsd ? $BSD_MOUNT_COMMAND : $LINUX_MOUNT_COMMAND;
 
-    if ($bsd) {
-	$mount_output = `$BSD_MOUNT_COMMAND`;
-    }
-    else {
-	$mount_output = `$LINUX_MOUNT_COMMAND`;
-    }
+    open (my $mount_fh, '-|', $mount_cmd) or die "Cannot run mount. $!\n";
+    $mount_output = do { local $/; <$mount_fh> }; # slurp entire output
+    close ($mount_fh);
+
     if ($mount_output =~ /\/.* on \/ type.*\((.*)\)/) {
 	$mount_opts_list = $1;
 	@mount_opts = split (/,/, $mount_opts_list);
@@ -787,7 +878,10 @@ sub _on_nonstd_fs {
 
     my $STAT = '/usr/bin/stat';
 
-    $fs_type = `$STAT -f -c %T \Q$file\E`;
+    open (my $stat_fh, '-|', $STAT, '-f', '-c', '%T', $file)
+	or die "Cannot run stat on $file. $!\n";
+    $fs_type = <$stat_fh>;
+    close ($stat_fh);
     chomp ($fs_type);
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
@@ -801,9 +895,14 @@ sub _desired_flag_mismatch {
     my ($flags, $perms, $nlinks, $uid, $gid);
 
     if ($bsd) {
-	my $LSFLAGS = '/bin/ls -lod';
-	$LSFLAGS = '/bin/ls -lOd' if ($^O eq 'darwin');
-        $flags = `$LSFLAGS \Q$file\E`;
+	my $LS = '/bin/ls';
+	my @ls_args = $^O eq 'darwin' ? ('-l', '-O', '-d') : ('-l', '-o', '-d');
+
+	open (my $ls_fh, '-|', $LS, @ls_args, $file)
+	    or die "Cannot run ls on $file. $!\n";
+	$flags = <$ls_fh>;
+	close ($ls_fh);
+
         ($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 	if ($desired_flag =~ /^no(.*$)/) {
 	    return 0 if ($flags eq '-');
@@ -814,8 +913,12 @@ sub _desired_flag_mismatch {
 	return $flags;
     }
     else {
-	my $LSFLAGS = '/usr/bin/lsattr -d';
-	$flags = `$LSFLAGS \Q$file\E`;
+	my $LSATTR = '/usr/bin/lsattr';
+
+	open (my $lsattr_fh, '-|', $LSATTR, '-d', $file)
+	    or die "Cannot run lsattr on $file. $!\n";
+	$flags = <$lsattr_fh>;
+	close ($lsattr_fh);
 	($flags) = split (/\s+/, $flags);
 	return 0 if ($desired_flag =~ /\+i/ && $flags =~ /i/);
 	return 0 if ($desired_flag =~ /-i/ && $flags =~ /^\-+$/);
@@ -866,15 +969,15 @@ sub _audit_file {
     $printed_something = 0;
     $spaces = $recurse_level * 3;
 
-    if ($linux && ((-l $file) || (-c $file) || (&_on_nonstd_fs ($file)))) {
+    if ($linux && ((-l $file) || (-c $file) || (_on_nonstd_fs ($file)))) {
 	print "Warning: ignoring symlink. $file\n" if (-l $file);
 	print "Warning: ignoring special character file. $file\n" if (-c $file);
-	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (&_on_nonstd_fs ($file));
+	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (_on_nonstd_fs ($file));
     }
     elsif (-d $file) {
 	# We care about the dir itself.
 	if (!$dont_lock_top_level_dir_flag) {
-	    if ($flags = &_desired_flag_mismatch ($file, $desired_flag)) {
+	    if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
 		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n";
 		$printed_something = 1;
 	    }
@@ -887,7 +990,7 @@ sub _audit_file {
 	foreach $subfile (@subfiles) {
 	    if ($linux && ((-l "$file/$subfile") ||
 		(-c "$file/$subfile") ||
-		(&_on_nonstd_fs ("$file/$subfile")))) {
+		(_on_nonstd_fs ("$file/$subfile")))) {
 		# Ignore links, special character files, and files on
 		# non-standard mounted filesystems.
 		next;
@@ -895,10 +998,10 @@ sub _audit_file {
 	    # If we need to recurse.
 	    elsif (-d "$file/$subfile" && !$dont_recurse_flag) {
 		$recurse_level++;
-		&_audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
+		_audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
 		$recurse_level--;
 	    }
-	    elsif ($flags = &_desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
+	    elsif ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
 		if (!$printed_something) {
 		    print ' 'x$spaces, "In $file/:\n";
 		    $printed_something = 1;
@@ -910,7 +1013,7 @@ sub _audit_file {
     }
     # If a file, just audit the file.
     elsif (-e $file) {
-	if ($flags = &_desired_flag_mismatch ($file, $desired_flag)) {
+	if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
 	    print "$file (should be $desired_state, flags=$flags)\n";
 	}
     }
