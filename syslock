@@ -800,15 +800,16 @@ foreach $file (@files) {
     # switch to the append flag for this file. No securelevel restriction
     # applies to append-only flags. Processed on all invocations including
     # no-arg, so that a plain syslock/sysunlock manages all configured flags.
+    #
+    # IMPORTANT: the uchg and schg blocks above have already run for this
+    # file by the time we get here, so $lock_flag is already correctly set
+    # for any uchg/schg file. The uappnd restore branch must NOT overwrite
+    # that -- it simply clears $uappnd_group_in_use_flag and lets the
+    # uchg/schg blocks' result stand.
     if ($uappnd_group_flag) {
 	my $append_tag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '\+a';
 	if (grep (/^$append_tag$/, @file_group_tags)) {
-	    if (!$uappnd_group_in_use_flag) {
-		# Save the current immutability flags before switching to append.
-		$temp_lock_flag   = $lock_flag;
-		$temp_unlock_flag = $unlock_flag;
-		$uappnd_group_in_use_flag = 1;
-	    }
+	    $uappnd_group_in_use_flag = 1;
 	    # Switch to append flag.
 	    if ($bsd) {
 		$lock_flag   = $BSD_USER_APPEND_FLAG_ON;
@@ -819,12 +820,22 @@ foreach $file (@files) {
 		$unlock_flag = $LINUX_APPEND_FLAG_OFF;
 	    }
 	}
-	# Restore exactly the flags that were in effect before the uappnd switch,
-	# preserving any securelevel-driven adjustments already made above.
+	# Leaving a uappnd/+a file: clear the flag. The uchg/schg blocks
+	# above have already set $lock_flag correctly for this file, so
+	# do not restore from any saved value -- just get out of the way.
 	elsif ($uappnd_group_in_use_flag) {
 	    $uappnd_group_in_use_flag = 0;
-	    $lock_flag   = $temp_lock_flag;
-	    $unlock_flag = $temp_unlock_flag;
+	    # If neither uchg nor schg block fired for this file (e.g. it
+	    # is a plain implicit-flag file with no explicit uchg/schg tag),
+	    # reset $lock_flag to the global immutability default so it is
+	    # not left pointing at the append flag.
+	    if (!$uchg_group_in_use_flag && !$schg_group_in_use_flag) {
+		$lock_flag   = $bsd ? ($uchg_group_flag ? $BSD_USER_IMMUTABLE_FLAG_ON
+						        : $BSD_SYS_IMMUTABLE_FLAG_ON)
+				    : $LINUX_IMMUTABLE_FLAG_ON;
+		$unlock_flag = $bsd ? "no$lock_flag" : $LINUX_IMMUTABLE_FLAG_OFF;
+	    }
+	    # Otherwise uchg/schg already set $lock_flag correctly -- leave it.
 	}
     }
 
