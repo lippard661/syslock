@@ -89,8 +89,8 @@
 #    config file checks for path validation and config file permissions,
 #    use unveil on OpenBSD to prevent file executions, eliminate use of
 #    glob and backticks.
-# Modified 27 March 2026 by Claude at the direction of Jim Lippard to
-#    add append-only flag support:
+# Modified 27 March 2026 by Claude at the direction of Jim Lippard to add
+#    append-only flag support:
 #    BSD uappnd/nouappnd group tag and Linux +a/-a group tag. These behave
 #    like uchg groups but are never blocked by securelevel. Processed on all
 #    invocations including no-arg syslock/sysunlock. To narrow to only the
@@ -101,6 +101,11 @@
 #    (they are mutually exclusive per group line; use two group lines with
 #    a shared group name to apply different flags to different files within
 #    the same logical group).
+#    Also added glob support in config file paths: glob characters (*, ?, [])
+#    are allowed in the filename component of a path (the final segment after
+#    the last /). The directory prefix must be a literal path. A bare /*
+#    filename is not allowed (use directory syntax instead). Globs are
+#    expanded at config-parse time; non-matching globs produce a warning.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s
 #    is used (as well as when it is not). File paths without a ! will
@@ -454,27 +459,50 @@ while (<CONFIG>) {
     elsif (/^([\-\+!])(.*)/) {
 	$options = $1;
 	$path = $2;
-	$path = _file_warnings ($path); # get untainted path back
-	
-	if ($options =~ /-/) {
-	    $dont_lock_top_level_dir{$path} = 1;
-	    print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
+	if ($path =~ /[*?\[]/) {
+	    # Glob pattern -- expand and register each result.
+	    my @expanded = _expand_glob ($path, $options);
+	    for my $expanded_path (@expanded) {
+		$dont_lock_top_level_dir{$expanded_path} = 1 if ($options =~ /-/);
+		$dont_recurse{$expanded_path} = 1           if ($options =~ /\+/);
+		$singleuser_unlocked{$expanded_path} = 1    if ($options =~ /!/);
+		push (@files, $expanded_path);
+		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
+	    }
 	}
-	if ($options =~ /\+/) {
-	    $dont_recurse{$path} = 1;
-	    print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
+	else {
+	    $path = _file_warnings ($path); # get untainted path back
+	    
+	    if ($options =~ /-/) {
+		$dont_lock_top_level_dir{$path} = 1;
+		print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
+	    }
+	    if ($options =~ /\+/) {
+		$dont_recurse{$path} = 1;
+		print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
+	    }
+	    if ($options =~ /!/) {
+		$singleuser_unlocked{$path} = 1;
+		print "DEBUG: singleuser_unlocked: $path\n" if ($debug_flag);
+	    }
+	    push (@files, $path);
+	    $group_tags{$path} = $current_group_tags if ($current_group_tags);
 	}
-	if ($options =~ /!/) {
-	    $singleuser_unlocked{$path} = 1;
-	    print "DEBUG: singleuser_unlocked: $path\n" if ($debug_flag);
-	}
-	push (@files, $path);
-	$group_tags{$path} = $current_group_tags if ($current_group_tags);
     }
     else {
-	$path = _file_warnings ($_);
-	push (@files, $path);
-	$group_tags{$path} = $current_group_tags if ($current_group_tags);
+	if ($_ =~ /[*?\[]/) {
+	    # Glob pattern -- expand and register each result.
+	    my @expanded = _expand_glob ($_, '');
+	    for my $expanded_path (@expanded) {
+		push (@files, $expanded_path);
+		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
+	    }
+	}
+	else {
+	    $path = _file_warnings ($_);
+	    push (@files, $path);
+	    $group_tags{$path} = $current_group_tags if ($current_group_tags);
+	}
     }
 }
 close (CONFIG);
@@ -1004,6 +1032,104 @@ sub _file_warnings {
     }
 
     return $clean_path;
+}
+
+# Subroutine to validate and expand a glob pattern from the config file.
+# Glob characters (*, ?, []) are only permitted in the final path component
+# (the filename portion after the last /). The directory prefix must be a
+# literal absolute path with no wildcards. A bare /* filename (the entire
+# filename component is just *) is rejected -- use directory syntax instead.
+# Each expanded path is passed through _file_warnings for validation and
+# untainting. Returns a list of expanded, validated paths.
+sub _expand_glob {
+    my ($pattern, $prefix_opts) = @_;
+    my @results;
+
+    # Reject shell metacharacters (other than the glob chars we handle).
+    if ($pattern =~ /[;&|`\$\(\)<>]/) {
+        die "Shell metacharacters in config file glob pattern not allowed. $pattern\n";
+    }
+    # Must be an absolute path.
+    if ($pattern !~ m{^/}) {
+        die "Only absolute paths allowed in config file. $pattern\n";
+    }
+    # Reject directory traversal.
+    if ($pattern =~ /\.\./) {
+        die "Path traversal (..) not allowed in config file. $pattern\n";
+    }
+    # Reject null bytes.
+    if ($pattern =~ /\0/) {
+        die "Null bytes not allowed in config file glob pattern. $pattern\n";
+    }
+
+    # Split into directory prefix and filename pattern.
+    # The directory prefix is everything up to and including the last /.
+    # The filename component is everything after the last /.
+    my ($dir_prefix, $filename_pat);
+    if ($pattern =~ m{^(.*/)([^/]+)$}) {
+        $dir_prefix   = $1;
+        $filename_pat = $2;
+    }
+    else {
+        die "Cannot parse glob pattern into directory and filename components. $pattern\n";
+    }
+
+    # Reject wildcards in the directory prefix.
+    if ($dir_prefix =~ /[*?\[]/) {
+        die "Glob characters are only permitted in the filename component, not the directory path. $pattern\n";
+    }
+
+    # Reject a bare * as the entire filename component (use directory syntax instead).
+    if ($filename_pat eq '*') {
+        die "Bare /* glob not permitted (use directory syntax to lock all files in a directory). $pattern\n";
+    }
+
+    # Validate the directory prefix: must consist only of safe characters.
+    unless ($dir_prefix =~ m{^([-\w./+]+)$}) {
+        die "Directory prefix in glob pattern contains unsafe characters. $pattern\n";
+    }
+    my $clean_dir = $1;  # Untainted directory prefix.
+
+    # Verify the directory exists.
+    unless (-d $clean_dir) {
+        print "Warning: Directory in glob pattern does not exist. $clean_dir\n";
+        return ();
+    }
+
+    # Validate filename pattern characters: word chars, dots, hyphens, plus,
+    # and the glob metacharacters *, ?, [, ].
+    unless ($filename_pat =~ m{^([-\w.+*?\[\]]+)$}) {
+        die "Filename pattern in glob contains unsafe characters. $pattern\n";
+    }
+    my $clean_pat = $1;  # Untainted filename pattern.
+
+    # Expand the glob. Use the cleaned components to avoid any taint issues.
+    my $full_pattern = $clean_dir . $clean_pat;
+    my @matches = glob ($full_pattern);
+
+    if (!@matches) {
+        print "Warning: Glob pattern in config matches no files. $full_pattern\n";
+        return ();
+    }
+
+    # Validate and untaint each expanded path via _file_warnings.
+    for my $match (@matches) {
+        # Skip directories when glob is used (directories should be listed
+        # explicitly to make the recursion/no-recursion intent clear).
+        if (-d $match) {
+            print "Warning: Glob pattern matched directory, skipping. $match\n";
+            next;
+        }
+        my $clean_match = _file_warnings ($match);
+        push (@results, $clean_match);
+        print "DEBUG: glob expanded: $full_pattern -> $clean_match\n" if ($debug_flag);
+    }
+
+    if (!@results) {
+        print "Warning: Glob pattern matched no files after filtering. $full_pattern\n";
+    }
+
+    return @results;
 }
 
 # Subroutine to determine if / is mounted read-only.

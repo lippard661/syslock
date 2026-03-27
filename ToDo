@@ -1,4 +1,4 @@
-Done (1.11):
+Done (1.12):
 
 * Added BSD user append-only flag and Linux +a flag support. This allows
   groups to be defined that use uappnd/nouappnd and +a/-a, which will only
@@ -9,6 +9,8 @@ Done (1.11):
   -g <group>:+a for Linux must be specified explicitly. This facilitates
   setting log files to append only and unsetting them as needed prior
   to log rotation (and resetting after log rotation is completed).
+* Added glob expansion in filenames only (not directory names, no globs
+  alone, only as part of file paths).
 
 Done:
 
