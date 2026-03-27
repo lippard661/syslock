@@ -1,3 +1,15 @@
+Done (1.11):
+
+* Added BSD user append-only flag and Linux +a flag support. This allows
+  groups to be defined that use uappnd/nouappnd and +a/-a, which will only
+  be modified when the group they are in is specified with -g.  If a
+  given group is ONLY for append-only flags, then -g <group> will turn
+  it on with syslock and off with syslock. If the given group is also
+  defined for immutable flags, then -g <group>:uappnd for BSD or
+  -g <group>:+a for Linux must be specified explicitly. This facilitates
+  setting log files to append only and unsetting them as needed prior
+  to log rotation (and resetting after log rotation is completed).
+
 Done:
 
 * Additional cleanup: removed glob, backticks, added taint
