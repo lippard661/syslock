@@ -89,8 +89,8 @@
 #    config file checks for path validation and config file permissions,
 #    use unveil on OpenBSD to prevent file executions, eliminate use of
 #    glob and backticks.
-# Modified 27 March 2026 by Claude at the direction of Jim Lippard to add
-#    append-only flag support:
+# Modified 27 March 2026 by Claude at the direction of Jim Lippard to
+#    add append-only flag support:
 #    BSD uappnd/nouappnd group tag and Linux +a/-a group tag. These behave
 #    like uchg groups but are never blocked by securelevel. Processed on all
 #    invocations including no-arg syslock/sysunlock. To narrow to only the
@@ -443,7 +443,7 @@ while (<CONFIG>) {
 						      ($linux &&
 						       $uappnd_group_in_use_flag &&
 						       $group_tag ne '+a'));
-	    if (!grep (/^$group_tag$/, @all_group_tags)) {
+	    if (!grep (/^\Q$group_tag\E$/, @all_group_tags)) {
 		push (@all_group_tags, $group_tag);
 	    }
 	}
@@ -514,10 +514,10 @@ if ($specified_group_tag) {
     if ($bsd && $specified_group_tag =~ /^$BSD_USER_IMMUTABLE_FLAG_ON$|^(.*):$BSD_USER_IMMUTABLE_FLAG_ON$/) {
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -538,10 +538,10 @@ if ($specified_group_tag) {
     elsif ($bsd && $specified_group_tag =~ /^$BSD_SYS_IMMUTABLE_FLAG_ON$|^(.*):$BSD_SYS_IMMUTABLE_FLAG_ON$/) {
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^$specified_group_tag$/, @schg_group_tags)) {
+	    elsif (!grep (/^\Q$specified_group_tag\E$/, @schg_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -563,10 +563,10 @@ if ($specified_group_tag) {
 	$uappnd_group_specified_flag = 1;
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^$specified_group_tag$/, @uappnd_group_tags)) {
+	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uappnd_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_APPEND_FLAG_ON\".\n";
 	    }
 	}
@@ -579,10 +579,10 @@ if ($specified_group_tag) {
 	$uappnd_group_specified_flag = 1;
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^$specified_group_tag$/, @uappnd_group_tags)) {
+	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uappnd_group_tags)) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"+a\".\n";
 	    }
 	}
@@ -590,7 +590,7 @@ if ($specified_group_tag) {
 	    die "No \"+a\" group tag found in config.\n";
 	}
     }
-    elsif (!grep (/^$specified_group_tag$/, @all_group_tags)) {
+    elsif (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
@@ -633,7 +633,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    }
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
-			if (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
 			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n";
 			}
 #			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON
@@ -659,7 +659,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    }
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
-			if (!grep (/^$specified_group_tag$/, @uchg_group_tags)) {
+			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
 			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n";
 			}
 
@@ -937,7 +937,7 @@ sub _in_group {
 	@file_group_tags) = @_;
 
     # If it's in the group ...
-    if (grep (/^$specified_group_tag$/, @file_group_tags)) {
+    if (grep (/^\Q$specified_group_tag\E$/, @file_group_tags)) {
 	# and we don't care about uchg, schg, or uappnd/+a...
 	return 1 if (!$uchg_group_specified_flag && !$schg_group_specified_flag && !$uappnd_group_specified_flag);
 	# or the specified group is already uchg/schg...
