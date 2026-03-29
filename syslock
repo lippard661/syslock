@@ -135,7 +135,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.12 of 27 March 2026';
+my $VERSION = '1.12a of 29 March 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -329,7 +329,7 @@ if (-e $BSD_LOCK_COMMAND) {
     }
 }
 elsif (-e $LINUX_LOCK_COMMAND) {
-    if ($ENV{'USER'} ne 'root') {
+    if ($> != 0) { # use effective UID instead of $ENV{'USER'} which is unlikely to be set on Linux in cron env.
 	die "Must be run as root.\n";
     }
     $linux = 1;

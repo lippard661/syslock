@@ -1,3 +1,7 @@
+Fixed (1.12a):
+* Check effective UID instead of $ENV{'USER'} on Linux, as the latter is not set in cron environment
+  where the new functionality intended for logs is likely to be used.
+
 Done (1.12):
 
 * Added BSD user append-only flag and Linux +a flag support. This allows
