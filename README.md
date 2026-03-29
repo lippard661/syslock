@@ -1,7 +1,7 @@
 # syslock
 syslock and sysunlock script for managing filesystem immutable flags.
 
-Now also supports append-only flags (user, not system, for BSD, and +a/-a for Linux).
+Now also supports append-only flags (system and user for BSD, and +a/-a for Linux).
 
 This is version 1.13 of 29 March 2026 from https://www.discord.org/lippard/software/
 
