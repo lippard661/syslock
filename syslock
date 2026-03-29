@@ -106,6 +106,27 @@
 #    the last /). The directory prefix must be a literal path. A bare /*
 #    filename is not allowed (use directory syntax instead). Globs are
 #    expanded at config-parse time; non-matching globs produce a warning.
+# Modified 29 March 2026 by Jim Lippard to fix Linux root check to use
+#    effective UID ($>) instead of $ENV{USER}, which is not set in all cron
+#    environments.
+# Modified 29 March 2026 by Claude at the direction of Jim Lippard:
+#    Added non-root support on BSD/macOS: non-root users may run syslock/
+#    sysunlock to manage uchg and uappnd flags on files they own. Non-root
+#    users default to ~/.syslock.conf (or specify -c), may not use schg or
+#    immutable-flag: schg, and may not use -s/-w/-f options. The securelevel
+#    check is skipped for non-root (not applicable to uchg/uappnd). A warning
+#    is issued at config-parse time for any listed file not owned by the
+#    invoking user. Linux chattr remains root-only.
+#    Added sappnd (BSD system append-only flag) group support. sappnd mirrors
+#    schg behavior with respect to securelevel: both setting and removing
+#    sappnd require securelevel < 1, or -f to force setting. This ensures
+#    that a group can be symmetrically locked and unlocked at a given
+#    securelevel -- if sappnd cannot be removed at the current securelevel,
+#    it will not be set either (unless -f is used). sappnd must be explicitly
+#    specified in a group tag (never implied by the global immutable-flag),
+#    may not appear in the immutable-flag: field, may not be combined with
+#    other flag types in the same group line, and is root-only. Together with
+#    schg, uchg, and uappnd, this covers all BSD locking-related chflags.
 #
 #    File paths beginning with a ! will be locked or unlocked when -s
 #    is used (as well as when it is not). File paths without a ! will
@@ -135,13 +156,14 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.12a of 29 March 2026';
+my $VERSION = '1.13 of 29 March 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
 
 my $BSD_SYS_IMMUTABLE_FLAG_ON = 'schg';
 my $BSD_USER_IMMUTABLE_FLAG_ON = 'uchg';
+my $BSD_SYS_APPEND_FLAG_ON = 'sappnd';
 my $BSD_USER_APPEND_FLAG_ON = 'uappnd';
 my $LINUX_IMMUTABLE_FLAG_ON = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
@@ -179,7 +201,7 @@ use constant {
 ### Global variables.
 
 my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
-    @uchg_group_tags, @schg_group_tags, @uappnd_group_tags);
+    @uchg_group_tags, @schg_group_tags, @uappnd_group_tags, @sappnd_group_tags);
 
 my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $singleuser_flag,
@@ -192,6 +214,10 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $uappnd_group_flag, # uappnd/+a group exists (BSD: uappnd, Linux: +a)
     $uappnd_group_in_use_flag, # uappnd/+a group is used in the section of config or current processing
     $uappnd_group_specified_flag, # -g uappnd or -g group:uappnd (BSD), -g +a or -g group:+a (Linux)
+    $sappnd_group_flag, # sappnd group exists (BSD only, root only)
+    $sappnd_group_in_use_flag, # sappnd group is used in the section of config or current processing
+    $sappnd_group_specified_flag, # -g sappnd or -g group:sappnd
+    $nonroot_flag, # running as non-root on BSD; restricts to uchg/uappnd only
     $debug_flag,
     $specified_group_tag, %opts, $options,
     $current_group_tags, @file_group_tags, $path, $verbose_flag,
@@ -221,10 +247,12 @@ $specified_group_tag = 0;
 $uchg_group_flag = 0;
 $schg_group_flag = 0;
 $uappnd_group_flag = 0;
+$sappnd_group_flag = 0;
 $verbose_flag = 0;
 $wait_flag = 0;
 $force_flag = 0;
 $audit_flag = 0;
+$nonroot_flag = 0;
 
 # Get options.
 getopts ($options, \%opts) || exit;
@@ -238,10 +266,10 @@ if ($#ARGV != -1) {
     }
 }
 
-$config_file = $opts{'c'} || $DEFAULT_CONFIG_FILE;
 $specified_group_tag = $opts{'g'};
 $uchg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_USER_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_USER_APPEND_FLAG_ON$/);
-$schg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_SYS_IMMUTABLE_FLAG_ON$/);
+$schg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_SYS_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_SYS_APPEND_FLAG_ON$/);
+$sappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)$BSD_SYS_APPEND_FLAG_ON$/);
 # uappnd (BSD) or +a (Linux) as suffix or standalone.
 if ($bsd) {
     $uappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)$BSD_USER_APPEND_FLAG_ON$/);
@@ -250,16 +278,45 @@ else {
     # On Linux, +a can only appear standalone or as :+a suffix -- handle after OS detection.
 }
 $singleuser_flag = $opts{'s'};
-$debug_flag = $opts{'d'};
-$verbose_flag = $opts{'v'};
-$wait_flag = $opts{'w'};
-$force_flag = $opts{'f'};
-$audit_flag = $opts{'a'};
+$debug_flag      = $opts{'d'};
+$verbose_flag    = $opts{'v'};
+$wait_flag       = $opts{'w'};
+$force_flag      = $opts{'f'};
+$audit_flag      = $opts{'a'};
 
 die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
 die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
 die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
 die "-w option not supported by your operating system.\n" if ($wait_flag && $^O ne 'openbsd');
+
+# Non-root detection: only meaningful on BSD. Linux non-root is handled
+# later in the OS detection block (chattr requires root on Linux).
+# Must be done before config file path is computed and before option
+# validation.
+if ($> != 0 && $^O ne 'linux') {
+    $nonroot_flag = 1;
+    die "The -s (single-user) option is not available for non-root users.\n" if ($singleuser_flag);
+    die "The -w (wait) option is not available for non-root users.\n"        if ($wait_flag);
+    die "The -f (force) option is not available for non-root users.\n"       if ($force_flag);
+    die "The -g sappnd option is not available for non-root users.\n"        if ($sappnd_group_specified_flag);
+}
+
+$config_file = $opts{'c'} || do {
+    if ($nonroot_flag) {
+	# Non-root BSD user: use ~/.syslock.conf unless -c was given.
+	my $home = $ENV{'HOME'};
+        die "HOME environment variable is not set.\n" unless defined $home;
+        die "HOME environment variable must be an absolute path.\n" unless $home =~ m{^/};
+        die "HOME environment variable contains path traversal.\n"  if $home =~ /\.\./;
+        # Untaint HOME.
+        ($home) = ($home =~ m{^([-\w./]+)$})
+            or die "HOME environment variable contains unsafe characters.\n";
+        "$home/.syslock.conf";
+    }
+    else {
+        $DEFAULT_CONFIG_FILE;
+    }
+};
 
 die "Cannot use -V (version) with other options.\n" if ($opts{'V'} &&
 							($singleuser_flag ||
@@ -315,9 +372,15 @@ $root_was_ro = 0;
 if (-e $BSD_LOCK_COMMAND) {
     $bsd = 1;
     @lock_command = ($BSD_LOCK_COMMAND);
+    # Non-root BSD users are restricted to uchg/uappnd regardless of
+    # immutable-flag: setting in config; the config parse enforces this too.
+    if ($nonroot_flag) {
+        $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
+        $unlock_flag = "no$lock_flag";
+    }
     # Default is user immutability for macOS (no single-user mode
     # on Apple Silicon).
-    if ($^O eq 'darwin') {
+    elsif ($^O eq 'darwin') {
 	$lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
 	$unlock_flag = "no$lock_flag";
     }
@@ -355,8 +418,8 @@ if (!@stat) {
 
 my ($file_mode, $uid) = @stat[2, 4];
 
-if ($uid != UID_ROOT) {
-    die "Config file $config_file must be owned by root (currently uid $uid)\n";
+if ($uid != UID_ROOT && $uid != $>) {
+    die "Config file $config_file must be owned by root or the invoking user (currently uid $uid)\n";
 }
 
 if ($file_mode & PERMS_WORLD_WRITABLE) {  # World-writable
@@ -379,6 +442,9 @@ while (<CONFIG>) {
 	    if ($linux) {
 		die "Config file specifies BSD lock flag type but this appears to be a Linux system.\n";
 	    }
+	    if ($nonroot_flag && $1 eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
+		die "Config file specifies schg but non-root users may only use uchg.\n";
+	    }
 	    $lock_flag = $1;
 	    $unlock_flag = "no$1";
 	}
@@ -389,6 +455,9 @@ while (<CONFIG>) {
 	}
 	elsif ($1 eq $BSD_USER_APPEND_FLAG_ON) {
 	    die "Config file: \"$BSD_USER_APPEND_FLAG_ON\" may not be used in immutable-flag: field; use it as a group tag instead.\n";
+	}
+	elsif ($1 eq $BSD_SYS_APPEND_FLAG_ON) {
+	    die "Config file: \"$BSD_SYS_APPEND_FLAG_ON\" may not be used in immutable-flag: field; use it as a group tag instead.\n";
 	}
 	else {
 	    die "Config file specifies unknown lock flag type \"$1\".\n";
@@ -407,6 +476,7 @@ while (<CONFIG>) {
 	}
 	if ($bsd && grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @new_group_tags)) {
 	    die "Cannot use both $BSD_USER_IMMUTABLE_FLAG_ON and $BSD_SYS_IMMUTABLE_FLAG_ON groups in combination. $_\n" if ($uchg_group_in_use_flag);
+	    die "Non-root users may not use schg groups. $_\n" if ($nonroot_flag);
 
 	    $schg_group_flag = 1;
 	    $schg_group_in_use_flag = 1;
@@ -421,6 +491,16 @@ while (<CONFIG>) {
 	    $uappnd_group_flag = 1;
 	    $uappnd_group_in_use_flag = 1;
 	}
+	# Detect BSD sappnd group tag.
+	elsif ($bsd && grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @new_group_tags)) {
+	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_IMMUTABLE_FLAG_ON or $BSD_SYS_IMMUTABLE_FLAG_ON in the same group. $_\n"
+		if ($uchg_group_in_use_flag || $schg_group_in_use_flag);
+	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_APPEND_FLAG_ON in the same group. $_\n"
+		if ($uappnd_group_in_use_flag);
+	    die "Non-root users may not use sappnd groups. $_\n" if ($nonroot_flag);
+	    $sappnd_group_flag = 1;
+	    $sappnd_group_in_use_flag = 1;
+	}
 	# Detect Linux +a group tag.
 	elsif ($linux && grep (/^\+a$/, @new_group_tags)) {
 	    $uappnd_group_flag = 1;
@@ -428,9 +508,10 @@ while (<CONFIG>) {
 	}
 	else {
 	    $uappnd_group_in_use_flag = 0;
+	    $sappnd_group_in_use_flag = 0;
 	}
-	# Prepend implicit tag for immutable flag (only when not a uappnd/+a group).
-	if ($bsd && !$schg_group_in_use_flag && !$uchg_group_in_use_flag && !$uappnd_group_in_use_flag) {
+	# Prepend implicit tag for immutable flag (only when not a uappnd/+a/sappnd group).
+	if ($bsd && !$schg_group_in_use_flag && !$uchg_group_in_use_flag && !$uappnd_group_in_use_flag && !$sappnd_group_in_use_flag) {
 	    $current_group_tags = $lock_flag . ' ' . $current_group_tags;
 	    $schg_group_in_use_flag = 1 if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON);
 	    $uchg_group_in_use_flag = 1 if ($lock_flag eq $BSD_USER_IMMUTABLE_FLAG_ON);
@@ -448,6 +529,9 @@ while (<CONFIG>) {
 						      ($linux &&
 						       $uappnd_group_in_use_flag &&
 						       $group_tag ne '+a'));
+	    push (@sappnd_group_tags, $group_tag) if ($bsd &&
+						      $sappnd_group_in_use_flag &&
+						      $group_tag ne $BSD_SYS_APPEND_FLAG_ON);
 	    if (!grep (/^\Q$group_tag\E$/, @all_group_tags)) {
 		push (@all_group_tags, $group_tag);
 	    }
@@ -513,6 +597,7 @@ print "DEBUG: closing config file\n" if ($debug_flag);
 $uchg_group_in_use_flag  = 0;
 $schg_group_in_use_flag  = 0;
 $uappnd_group_in_use_flag = 0;
+$sappnd_group_in_use_flag = 0;
 
 # Save the global immutability lock/unlock flags as established by OS
 # detection and the immutable-flag: config directive. Used by the uappnd
@@ -535,6 +620,9 @@ my $global_unlock_flag = $unlock_flag;
 # groupname:+a -- only use the subset of groupname that is also in +a
 #     group (Linux). This doesn't verify that the intersection is non-null.
 # +a -- only do +a group (Linux).
+# groupname:sappnd -- only use the subset of groupname that is also in sappnd
+#     group (BSD, root only). This doesn't verify that the intersection is non-null.
+# sappnd -- only do sappnd group (BSD, root only).
 #
 # Plain group name (no suffix): processes all files in the group, applying
 # whichever flag (immutable or append-only) is appropriate to each file.
@@ -624,15 +712,34 @@ if ($specified_group_tag) {
 	    die "No \"+a\" group tag found in config.\n";
 	}
     }
+    # BSD sappnd cases:
+    elsif ($bsd && $specified_group_tag =~ /^$BSD_SYS_APPEND_FLAG_ON$|^(.*):$BSD_SYS_APPEND_FLAG_ON$/) {
+	die "The sappnd group tag is not available for non-root users.\n" if ($nonroot_flag);
+	$sappnd_group_specified_flag = 1;
+	if (defined ($1)) {
+	    $specified_group_tag = $1;
+	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
+	    }
+	    elsif (!grep (/^\Q$specified_group_tag\E$/, @sappnd_group_tags)) {
+		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_APPEND_FLAG_ON\".\n";
+	    }
+	}
+	elsif (!$sappnd_group_flag) {
+	    die "No \"$BSD_SYS_APPEND_FLAG_ON\" group tag found in config.\n";
+	}
+    }
     elsif (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
 
 # Get system security level if BSD, using BSD_SYS_IMMUTABLE_FLAG_ON, or
-# there are schg groups.
+# there are schg or sappnd groups. Non-root users are restricted to
+# uchg/uappnd and cannot have schg/sappnd groups, so this block naturally
+# never fires for them.
 if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
-	     $schg_group_flag)) {
+	     $schg_group_flag || $sappnd_group_flag)) {
     my @sysctl_command = split (/\s+/, $BSD_SECURELEVEL_COMMAND);
     open (my $sysctl_fh, '-|', @sysctl_command) or die "Could not run sysctl. $!\n";
     $level = <$sysctl_fh>;
@@ -712,6 +819,41 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 	    print "Warning: System securelevel is $level; sysunlock will not unlock schg groups unless securelevel < 1.\n" if ($verbose_flag && $mode == $UNLOCK && $level > 0);
 	    print "Warning: System securelevel is $level; syslock will not lock schg groups unless -f option is used or securelevel < 1.\n" if ($verbose_flag && !$force_flag && $mode == $LOCK && $level > 0);
 	}
+	# For sappnd: mirrors schg behavior -- both setting and removing require
+	# securelevel < 1 or -f for setting. This ensures symmetry: a group with
+	# sappnd files that can be locked at a given securelevel can also be
+	# unlocked, and vice versa.
+	# If lock, -f (force) overrides securelevel requirement.
+	#    If uappnd groups in use alongside sappnd, they will be processed.
+	# If unlock, securelevel must be < 1.
+	# Don't die if -a (audit), but warn.
+	# Also die if sappnd group was explicitly specified (without -f for lock).
+	if ($sappnd_group_flag) {
+	    if ($mode == $LOCK) {
+		if ($sappnd_group_specified_flag && !$force_flag && !$audit_flag) {
+		    die "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n";
+		}
+		elsif ($audit_flag) {
+		    print "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n";
+		}
+		elsif (!$force_flag) {
+		    # sappnd files will be skipped in the per-file loop.
+		    print "Warning: System securelevel is $level; syslock will not set sappnd unless -f option is used or securelevel < 1.\n" if ($verbose_flag);
+		}
+	    }
+	    else { # mode == UNLOCK
+		if ($sappnd_group_specified_flag && !$audit_flag) {
+		    die "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n";
+		}
+		elsif ($audit_flag) {
+		    print "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n";
+		}
+		else {
+		    # sappnd files will be skipped in the per-file loop.
+		    print "Warning: System securelevel is $level; sysunlock will not remove sappnd unless securelevel < 1.\n" if ($verbose_flag);
+		}
+	    }
+	}
     }
 }
 
@@ -759,7 +901,7 @@ if (!$audit_flag && _root_ro()) {
 }
 
 foreach $file (@files) {
-    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag);
+    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag || $sappnd_group_flag);
 
     # uchg group is in config
     if ($uchg_group_flag) {
@@ -847,8 +989,26 @@ foreach $file (@files) {
     # The append-only flag switching above handles them correctly whether
     # a group is specified or not.
 
+    # sappnd group is in config (BSD only, root only). Both setting and
+    # removal require securelevel < 1 (or -f for setting), mirroring schg.
+    if ($sappnd_group_flag) {
+	if (grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @file_group_tags)) {
+	    next if ((!$force_flag || $mode == $UNLOCK) && $level > 0);
+	    # Only reach here if we're going to process this file.
+	    $sappnd_group_in_use_flag = 1;
+	    $lock_flag   = $BSD_SYS_APPEND_FLAG_ON;
+	    $unlock_flag = "no$BSD_SYS_APPEND_FLAG_ON";
+	}
+	# Restore if it's not a sappnd file.
+	elsif ($sappnd_group_in_use_flag) {
+	    $sappnd_group_in_use_flag = 0;
+	    $lock_flag   = $global_lock_flag;
+	    $unlock_flag = $global_unlock_flag;
+	}
+    }
+
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
-	(!$specified_group_tag || _in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, @file_group_tags))) {
+	(!$specified_group_tag || _in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, $sappnd_group_specified_flag, @file_group_tags))) {
 	if ($mode == $LOCK) {
 	    if ($specified_group_tag &&
 		$verbose_flag &&
@@ -860,6 +1020,7 @@ foreach $file (@files) {
 		    my $atag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
 		    print ":$atag" if ($specified_group_tag ne $atag);
 		}
+		print ":$BSD_SYS_APPEND_FLAG_ON" if ($sappnd_group_specified_flag && $specified_group_tag ne $BSD_SYS_APPEND_FLAG_ON);
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -917,6 +1078,7 @@ foreach $file (@files) {
 		    my $atag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
 		    print ":$atag" if ($specified_group_tag ne $atag);
 		}
+		print ":$BSD_SYS_APPEND_FLAG_ON" if ($sappnd_group_specified_flag && $specified_group_tag ne $BSD_SYS_APPEND_FLAG_ON);
 		print "\n";
 		$displayed_verbose_group_msg_flag = 1;
 	    }
@@ -977,12 +1139,13 @@ sub _in_group {
     my ($specified_group_tag,
 	$uchg_group_specified_flag,
 	$schg_group_specified_flag,
+	$sappnd_group_specified_flag,
 	@file_group_tags) = @_;
 
     # If it's in the group ...
     if (grep (/^\Q$specified_group_tag\E$/, @file_group_tags)) {
-	# and we don't care about uchg, schg, or uappnd/+a...
-	return 1 if (!$uchg_group_specified_flag && !$schg_group_specified_flag && !$uappnd_group_specified_flag);
+	# and we don't care about uchg, schg, uappnd/+a, or sappnd...
+	return 1 if (!$uchg_group_specified_flag && !$schg_group_specified_flag && !$uappnd_group_specified_flag && !$sappnd_group_specified_flag);
 	# or the specified group is already uchg/schg...
 	return 1 if (($uchg_group_specified_flag &&
 		      $specified_group_tag eq $BSD_USER_IMMUTABLE_FLAG_ON) ||
@@ -992,6 +1155,9 @@ sub _in_group {
 	return 1 if ($uappnd_group_specified_flag &&
 		     (($bsd && $specified_group_tag eq $BSD_USER_APPEND_FLAG_ON) ||
 		      ($linux && $specified_group_tag eq '+a')));
+	# or it's already the sappnd group itself...
+	return 1 if ($sappnd_group_specified_flag &&
+		     $specified_group_tag eq $BSD_SYS_APPEND_FLAG_ON);
 	# or it's also in the uchg/schg group...
 	return 1 if (($uchg_group_specified_flag &&
 		      grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) ||
@@ -1001,6 +1167,9 @@ sub _in_group {
 	return 1 if ($uappnd_group_specified_flag &&
 		     (($bsd && grep (/^$BSD_USER_APPEND_FLAG_ON$/, @file_group_tags)) ||
 		      ($linux && grep (/^\+a$/, @file_group_tags))));
+	# or it's also in the sappnd group...
+	return 1 if ($sappnd_group_specified_flag &&
+		     grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @file_group_tags));
     }
 
     # Otherwise.
@@ -1044,6 +1213,13 @@ sub _file_warnings {
     # Warn about symlinks.
     if ($linux && -l $clean_path) {
 	print "Warning: File path in config is a symlink. $clean_path\n";
+    }
+    # For non-root BSD users, warn if the file is not owned by the invoking user.
+    if ($nonroot_flag && -e $clean_path) {
+        my @fstat = stat ($clean_path);
+        if (@fstat && $fstat[4] != $>) {
+            print "Warning: $clean_path is not owned by uid $>; chflags will likely fail.\n";
+        }
     }
 
     return $clean_path;
@@ -1251,7 +1427,8 @@ sub _audit_file {
 
     if ($desired_flag =~ /^no(.*)$/) {
 	$desired_state = 'not append-only' if ($1 eq $BSD_USER_APPEND_FLAG_ON);
-	$desired_state = 'unlocked' if ($1 ne $BSD_USER_APPEND_FLAG_ON);
+	$desired_state = 'not sys-append-only' if ($1 eq $BSD_SYS_APPEND_FLAG_ON);
+	$desired_state = 'unlocked' if ($1 ne $BSD_USER_APPEND_FLAG_ON && $1 ne $BSD_SYS_APPEND_FLAG_ON);
     }
     elsif ($desired_flag eq '-i') {
 	$desired_state = 'unlocked';
@@ -1267,6 +1444,9 @@ sub _audit_file {
     }
     elsif ($desired_flag eq $BSD_USER_APPEND_FLAG_ON) {
 	$desired_state = 'append-only';
+    }
+    elsif ($desired_flag eq $BSD_SYS_APPEND_FLAG_ON) {
+	$desired_state = 'sys-append-only';
     }
     else {
 	$desired_state = 'locked with ' . $desired_flag;
