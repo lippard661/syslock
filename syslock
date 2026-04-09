@@ -774,7 +774,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
 		}
 		elsif ($audit_flag) {
-		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
+		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" unless $quiet_flag;
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag && !$force_flag) {
@@ -800,7 +800,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    die "System securelevel is $level; sysunlock requires securelevel < 1.\n";
 		}
 		elsif ($audit_flag) {
-		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n";
+		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n" unless $quiet_flag;
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag) {
@@ -845,7 +845,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    die "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n";
 		}
 		elsif ($audit_flag) {
-		    print "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n";
+		    print "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n" unless $quiet_flag;
 		}
 		elsif (!$force_flag) {
 		    # sappnd files will be skipped in the per-file loop.
@@ -857,7 +857,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    die "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n";
 		}
 		elsif ($audit_flag) {
-		    print "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n";
+		    print "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n" unless $quiet_flag;
 		}
 		else {
 		    # sappnd files will be skipped in the per-file loop.
