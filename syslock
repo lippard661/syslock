@@ -1,4 +1,4 @@
-#!/usr/bin/perl -wT
+#!/usr/bin/perl -T
 # Script to lock/unlock system files by making them immutable.
 # Unlocking must be done as root from single user mode.
 #
@@ -127,6 +127,12 @@
 #    may not appear in the immutable-flag: field, may not be combined with
 #    other flag types in the same group line, and is root-only. Together with
 #    schg, uchg, and uappnd, this covers all BSD locking-related chflags.
+# Modified 8 April 2026 by Jim Lippard to use "use warnings" instead of -w.
+#    Added -q (quiet) option for use with -a (audit): suppresses all per-file
+#    output and communicates result via exit code only. Exit 0 means the
+#    filesystem matches the expected state; exit 1 means at least one
+#    divergence exists. Useful for scripted checks, e.g.:
+#      sysunlock -a -q -g local && proceed_with_install
 #
 #    File paths beginning with a ! will be locked or unlocked when -s
 #    is used (as well as when it is not). File paths without a ! will
@@ -142,6 +148,7 @@
 ### Required packages.
 
 use strict;
+use warnings;
 use Getopt::Std;
 use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 use if $^O eq 'openbsd', 'OpenBSD::Unveil';
@@ -156,7 +163,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.13 of 29 March 2026';
+my $VERSION = '1.14 of 9 April 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -189,8 +196,8 @@ my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
 
-my $LOCK_OPTIONS = 'asdfc:g:vwV';
-my $UNLOCK_OPTIONS = 'asdc:g:vV';
+my $LOCK_OPTIONS = 'asdfc:g:vwqV';
+my $UNLOCK_OPTIONS = 'asdc:g:vqV';
 
 use constant {
     PERMS_WORLD_WRITABLE => 0002,
@@ -224,7 +231,7 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $displayed_verbose_group_msg_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
     $waiting_on_libs, $start_time, $reason,
-    $force_flag, $audit_flag);
+    $force_flag, $audit_flag, $quiet_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
 
 ### Main program.
@@ -252,6 +259,7 @@ $verbose_flag = 0;
 $wait_flag = 0;
 $force_flag = 0;
 $audit_flag = 0;
+$quiet_flag = 0;
 $nonroot_flag = 0;
 
 # Get options.
@@ -283,10 +291,12 @@ $verbose_flag    = $opts{'v'};
 $wait_flag       = $opts{'w'};
 $force_flag      = $opts{'f'};
 $audit_flag      = $opts{'a'};
+$quiet_flag      = $opts{'q'};
 
 die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
 die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
 die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
+die "Cannot use -q (quiet) without -a (audit).\n" if ($quiet_flag && !$audit_flag);
 die "-w option not supported by your operating system.\n" if ($wait_flag && $^O ne 'openbsd');
 
 # Non-root detection: only meaningful on BSD. Linux non-root is handled
@@ -325,6 +335,7 @@ die "Cannot use -V (version) with other options.\n" if ($opts{'V'} &&
 							 $wait_flag ||
 							 $force_flag ||
 							 $audit_flag ||
+							 $quiet_flag ||
 							 $specified_group_tag ||
 							 $opts{'c'}));
 
@@ -900,6 +911,9 @@ if (!$audit_flag && _root_ro()) {
     }
 }
 
+# Accumulates whether any audit mismatch was found; used by -q exit code.
+my $any_mismatch = 0;
+
 foreach $file (@files) {
     @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag || $sappnd_group_flag);
 
@@ -1026,7 +1040,7 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is unlocked that would be locked by command.
-		_audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		$any_mismatch |= _audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
 	    }
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
@@ -1084,7 +1098,7 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is locked that would be unlocked by command.
-		_audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		$any_mismatch |= _audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
 	    }
 	    elsif (-d $file) {
 		if ($dont_recurse{$file}) {
@@ -1132,6 +1146,11 @@ if ($root_was_ro) {
     else {
 	system ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_RO_ARGS) unless ($debug_flag);
     }
+}
+
+# -q (quiet) audit: exit 0 if filesystem matches expected state, 1 if not.
+if ($audit_flag && $quiet_flag) {
+    exit ($any_mismatch ? 1 : 0);
 }
 
 # Subroutine to return 1 if file is in specified group, 0 otherwise.
@@ -1424,6 +1443,7 @@ sub _recurse_lock_or_unlock {
 sub _audit_file {
     my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $recurse_level) = @_;
     my ($flags, $desired_state, @subfiles, $subfile, $printed_something, $spaces);
+    my $found_mismatch = 0;
 
     if ($desired_flag =~ /^no(.*)$/) {
 	$desired_state = 'not append-only' if ($1 eq $BSD_USER_APPEND_FLAG_ON);
@@ -1458,16 +1478,17 @@ sub _audit_file {
     $spaces = $recurse_level * 3;
 
     if ($linux && ((-l $file) || (-c $file) || (_on_nonstd_fs ($file)))) {
-	print "Warning: ignoring symlink. $file\n" if (-l $file);
-	print "Warning: ignoring special character file. $file\n" if (-c $file);
-	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (_on_nonstd_fs ($file));
+	print "Warning: ignoring symlink. $file\n" if (-l $file && !$quiet_flag);
+	print "Warning: ignoring special character file. $file\n" if (-c $file && !$quiet_flag);
+	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (_on_nonstd_fs ($file) && !$quiet_flag);
     }
     elsif (-d $file) {
 	# We care about the dir itself.
 	if (!$dont_lock_top_level_dir_flag) {
 	    if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
-		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n";
+		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 		$printed_something = 1;
+		$found_mismatch = 1;
 	    }
 	}
 	# Check subdir contents.
@@ -1486,27 +1507,31 @@ sub _audit_file {
 	    # If we need to recurse.
 	    elsif (-d "$file/$subfile" && !$dont_recurse_flag) {
 		$recurse_level++;
-		_audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
+		$found_mismatch |= _audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
 		$recurse_level--;
 	    }
 	    elsif ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
-		if (!$printed_something) {
+		if (!$printed_something && !$quiet_flag) {
 		    print ' 'x$spaces, "In $file/:\n";
 		    $printed_something = 1;
 		}
-		print ' 'x$spaces, "   $subfile (should be $desired_state, flags=$flags)\n";
-
+		print ' 'x$spaces, "   $subfile (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
+		$found_mismatch = 1;
 	    }
 	}
     }
     # If a file, just audit the file.
     elsif (-e $file) {
 	if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
-	    print "$file (should be $desired_state, flags=$flags)\n";
+	    print "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
+	    $found_mismatch = 1;
 	}
     }
     # If nonexistent, just report that.
     else {
-	print "File path in config inaccessible or does not exist. $!. $file\n";
+	print "File path in config inaccessible or does not exist. $!. $file\n" unless $quiet_flag;
+	# A nonexistent file is not a flag mismatch per se; don't count as mismatch.
     }
+
+    return $found_mismatch;
 }

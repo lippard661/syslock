@@ -1,3 +1,12 @@
+Done (1.14): Added -q (quiet) to use with -a to suppress individual reports and just
+return 0 if all is as expected and 1 otherwise.
+
+Done (1.13):
+* Allow non-root use on BSD, enforcing uchg/uappnd only and limiting
+  options that don't make sense for non-root.
+* Support sappnd.  No call for the arch flag (a no-op) or nodump,
+  which aren't about locking. (Ditto for macOS's opaque and hidden.)
+
 Fixed (1.12a):
 * Check effective UID instead of $ENV{'USER'} on Linux, as the latter is not set in cron environment
   where the new functionality intended for logs is likely to be used.
