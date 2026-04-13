@@ -133,6 +133,10 @@
 #    filesystem matches the expected state; exit 1 means at least one
 #    divergence exists. Useful for scripted checks, e.g.:
 #      sysunlock -a -q -g local && proceed_with_install
+# Modified 13 April 2026 by Claude at the direction of Jim Lippard to
+#    make sysunlock -a ignore flags that are not locking-related flags
+#    and make syslock -a note discrepancies where other locking-related
+#    flags are present (in both BSD and Linux cases).
 #
 #    File paths beginning with a ! will be locked or unlocked when -s
 #    is used (as well as when it is not). File paths without a ! will
@@ -163,7 +167,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.14 of 9 April 2026';
+my $VERSION = '1.15 of 13 April 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -1395,12 +1399,37 @@ sub _desired_flag_mismatch {
 	close ($ls_fh);
 
         ($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
-	if ($desired_flag =~ /^no(.*$)/) {
-	    return 0 if ($flags eq '-');
+
+	# flags may be a comma-separated list (e.g. "uchg,compressed" on macOS).
+	# Split and check only for the specific locking flag of interest,
+	# ignoring unrelated flags like compressed, restricted, datavault, etc.
+	my @flag_list = ($flags eq '-') ? () : split (/,/, $flags);
+
+	# All BSD locking-related flags. Used to detect "locked by something
+	# else" when auditing for an unlocked state.
+	my @all_lock_flags = ($BSD_SYS_IMMUTABLE_FLAG_ON,  # schg
+			      $BSD_USER_IMMUTABLE_FLAG_ON, # uchg
+			      $BSD_SYS_APPEND_FLAG_ON,     # sappnd
+			      $BSD_USER_APPEND_FLAG_ON);   # uappnd
+
+	if ($desired_flag =~ /^no(.+)$/) {
+	    my $bare_flag = $1;
+	    # Desired: flag should NOT be set. Mismatch if the specific flag
+	    # is present, OR if any other locking flag is present -- a file
+	    # locked by any means cannot be written to regardless of which
+	    # specific flag syslock manages.
+	    return 0 unless grep (/^$bare_flag$/, @flag_list) ||
+			    grep { my $f = $_; grep(/^$f$/, @flag_list) } @all_lock_flags;
 	}
 	else {
-	    return 0 if ($flags eq $desired_flag);
+	    # Desired: flag SHOULD be set. No mismatch only if the expected
+	    # flag is present AND no other locking flag is also present
+	    # (an unexpected additional constraint is also a discrepancy).
+	    return 0 if  grep (/^$desired_flag$/, @flag_list) &&
+			!grep { my $f = $_; $f ne $desired_flag &&
+				grep(/^$f$/, @flag_list) } @all_lock_flags;
 	}
+	# Return the full flags string so audit output is informative.
 	return $flags;
     }
     else {
@@ -1411,10 +1440,26 @@ sub _desired_flag_mismatch {
 	$flags = <$lsattr_fh>;
 	close ($lsattr_fh);
 	($flags) = split (/\s+/, $flags);
-	return 0 if ($desired_flag =~ /\+i/ && $flags =~ /i/);
-	return 0 if ($desired_flag =~ /-i/ && $flags !~ /i/);
-	return 0 if ($desired_flag =~ /\+a/ && $flags =~ /a/);
-	return 0 if ($desired_flag =~ /-a/ && $flags !~ /a/);
+
+	# For Linux, the locking-relevant flags are i (immutable) and a (append-only).
+	# "No mismatch" for a positive flag means exactly that flag is set and the
+	# other locking flag is absent. "No mismatch" for a negative flag means
+	# neither locking flag is present -- a file locked by any means is not
+	# writable regardless of which specific flag is expected.
+	if ($desired_flag =~ /\+i/) {
+	    return 0 if ($flags =~ /i/ && $flags !~ /a/);
+	}
+	elsif ($desired_flag =~ /-i/) {
+	    return 0 if ($flags !~ /i/ && $flags !~ /a/);
+	}
+	elsif ($desired_flag =~ /\+a/) {
+	    return 0 if ($flags =~ /a/ && $flags !~ /i/);
+	}
+	elsif ($desired_flag =~ /-a/) {
+	    return 0 if ($flags !~ /a/ && $flags !~ /i/);
+	}
+	# Return the flags string with dashes stripped for readability,
+	# preserving all flag characters so the output is fully informative.
 	$flags =~ s/^-+$/-/;
 	$flags =~ s/-//g if ($flags ne '-');
 	return $flags;

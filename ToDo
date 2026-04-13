@@ -1,5 +1,12 @@
+(Done 1.15): Fix bugs in -a handling when there are discrepancies with other
+flags. sysunlock -a shouldn't care about non-locking flags, and syslock -a
+should care about conflicting locking flags. (Handled for both BSD and Linux
+cases.)
+
 Done (1.14): Added -q (quiet) to use with -a to suppress individual reports and just
-return 0 if all is as expected and 1 otherwise.
+return 0 if all is as expected and 1 otherwise. This will be used by install.pl
+to see if installation can proceed even if schg groups are used and system
+securelevel is > 0 (if they are already unlocked).
 
 Done (1.13):
 * Allow non-root use on BSD, enforcing uchg/uappnd only and limiting
