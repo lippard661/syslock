@@ -1,3 +1,5 @@
+(Done 1.15a): Warn if config file is world-readable.
+
 (Done 1.15): Fix bugs in -a handling when there are discrepancies with other
 flags. sysunlock -a shouldn't care about non-locking flags, and syslock -a
 should care about conflicting locking flags. (Handled for both BSD and Linux

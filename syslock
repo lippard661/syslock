@@ -137,6 +137,8 @@
 #    make sysunlock -a ignore flags that are not locking-related flags
 #    and make syslock -a note discrepancies where other locking-related
 #    flags are present (in both BSD and Linux cases).
+# Modified 16 April 2026 by Jim Lippard to warn if config file is world
+#    readable (and OpenBSD package now sets it to 0600).
 #
 #    File paths beginning with a ! will be locked or unlocked when -s
 #    is used (as well as when it is not). File paths without a ! will
@@ -167,7 +169,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.15 of 13 April 2026';
+my $VERSION = '1.15a of 16 April 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -205,6 +207,7 @@ my $UNLOCK_OPTIONS = 'asdc:g:vqV';
 
 use constant {
     PERMS_WORLD_WRITABLE => 0002,
+    PERMS_WORLD_READABLE => 0004,
     PERMS_GROUP_WRITABLE => 0020,
     UID_ROOT => 0,
 };
@@ -439,6 +442,10 @@ if ($uid != UID_ROOT && $uid != $>) {
 
 if ($file_mode & PERMS_WORLD_WRITABLE) {  # World-writable
     die "Config file $config_file must not be world-writable\n";
+}
+
+if ($file_mode & PERMS_WORLD_READABLE) {  # World-readable
+    warn "Config file $config_file is world-readable; consider chmod 0600.\n";
 }
 
 if ($file_mode & PERMS_GROUP_WRITABLE) {  # Group-writable
