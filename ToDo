@@ -1,3 +1,5 @@
+(Done 1.15b): Remove uchg-only limitation for macOS.
+
 (Done 1.15a): Warn if config file is world-readable.
 
 (Done 1.15): Fix bugs in -a handling when there are discrepancies with other
