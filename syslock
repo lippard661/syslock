@@ -771,7 +771,12 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
     $level = <$sysctl_fh>;
     close ($sysctl_fh);
     chomp ($level);
-    $level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+    if ($^O eq 'darwin') {
+	$level =~ s/kern\.securelevel:\s*(\d+)/$1/;
+    }
+    else {
+	$level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+    }
 
     # Warnings and errors.
     if ($level > 0) {
