@@ -202,6 +202,7 @@ my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
 my $SYSCTL = '/sbin/sysctl';
+$SYSCTL = '/usr/sbin/sysctl' if ($^O eq 'darwin');
 my $BSD_SECURELEVEL_COMMAND = "$SYSCTL kern.securelevel";
 
 my $ECHO = '/bin/echo';
