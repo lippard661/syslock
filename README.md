@@ -228,10 +228,10 @@ files; use :uchg to unlock only zone files, leaving schg config files locked):
 /usr/local/bin/syslock -g dns:uchg
 ```
 
-**System upgrade** (unlock everything to avoid partial install failures):
+**System patch or upgrade** (unlock everything to avoid partial install failures):
 ```sh
 sysunlock
-syspatch   # or pkg_add -u, or whatever upgrade mechanism
+syspatch   # or pkg_add -u, or sysupgrade, or apt update,  or whatever upgrade mechanism
 syslock
 ```
 
