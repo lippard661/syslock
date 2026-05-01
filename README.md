@@ -31,7 +31,7 @@ require root, except uchg/uappnd operations with a user config file).
   that only root can set/unset schg, while non-root users can set/unset
   uchg on files they own. Do not raise kern.securelevel on macOS — there
   is no single-user mode to recover from it.
-- `uappnd` supported; `sappnd` not meaningful.
+- `uappnd` and `sappnd` supported; same caveats apply.
 
 **Linux**:
 - `+i` — immutable (root only, removable at any time)
