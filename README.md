@@ -76,11 +76,15 @@ sysunlock -g group[:flag]   Unlock files in named group(s)
 -a                Audit mode: report files that should be locked (syslock)
                   or unlocked (sysunlock) but aren't. Exit 0 if consistent,
                   1 if not.
+-o		  Operational scope (with -a only): only audit what would
+		  actually be changed in the circumstance (e.g., ignore
+		  schg groups if system securelevel > 0 on *BSD). If
+		  an schg group is explicitly specified, -o is overridden.
 -q                Quiet (with -a only): suppress output, return exit code only.
                   Used by install.pl to verify a group is unlocked before
                   proceeding with installation.
 -f                Force: lock schg/sappnd flags even if securelevel > 0.
-                  (syslock only)
+                  (syslock only, and can't be used with -a)
 -s                Operate only on files marked with ! in the config (KARL
                   relink/reorder files). (OpenBSD only)
 -w                After locking, wait for kernel reorder and library relink
@@ -154,6 +158,7 @@ The sample configs define overlapping groups following this pattern:
 - **binaries** — /usr/bin, /usr/sbin, /usr/local/bin, /usr/local/sbin
 - **libraries** — /usr/lib, /usr/libexec, /usr/local/lib, etc.
 - **kernel** — /bsd and kernel relink files
+- **presecure** ? files that if modified could be used before securelevel is raised or prevent securelevel from being raised
 - **ssl** — /etc/ssl certificate directory
 - **ssh** — /etc/ssh
 - **signify** — /etc/signify key directory

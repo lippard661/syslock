@@ -1,3 +1,12 @@
+(Done 1.16): Added -o (operational scope) to limit -a (audit) to
+what can actually change in the given circumstance (based on system
+securelevel). Is effective no-op if securelevel=0; ignores schg
+groups if using uchg default and securelevel>0. Can be overridden
+if schg groups are explicitly given with -g on the command line
+(e.g., either -g schg or -g <groupname>:schg). Also updated all
+sample configs to add "presecure" group for BSD and improve group
+structure and consistency across platforms.
+
 (Done 1.15b): Remove uchg-only limitation for macOS.
 
 (Done 1.15a): Warn if config file is world-readable.

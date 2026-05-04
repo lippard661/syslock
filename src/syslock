@@ -159,6 +159,19 @@
 #    unlocked in single user mode, unless all other libraries are
 #    listed individually, since there's not currently a way to make an
 #    exception within a directory that is otherwise being locked.
+# Modified 3 May 2026 by Claude at the direction of Jim Lippard to fix
+#    -a (audit) incorrectly skipping schg/sappnd files at securelevel > 0
+#    (the per-file next was not guarded by !$audit_flag, causing audit to
+#    silently skip all schg/sappnd files and falsely report clean state).
+#    Added -o (operational) option for use with -a (audit): restricts the
+#    audit to only the files that the corresponding lock/unlock operation
+#    would actually touch at the current securelevel. Without -o, -a checks
+#    all files in the group regardless of securelevel constraints (full
+#    diagnostic scope). With -o, schg/sappnd files are skipped at
+#    securelevel > 0 just as they would be in a normal lock/unlock run,
+#    giving an accurate "ready for this operation" answer. Useful for
+#    scripted pre-flight checks, e.g.:
+#      sysunlock -a -q -o -g local && proceed_with_install
 
 ### Required packages.
 
@@ -178,7 +191,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.15b of 19 April 2026';
+my $VERSION = '1.16 of 4 May 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -212,8 +225,8 @@ my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
 
-my $LOCK_OPTIONS = 'asdfc:g:vwqV';
-my $UNLOCK_OPTIONS = 'asdc:g:vqV';
+my $LOCK_OPTIONS = 'asdfc:g:vwqoV';
+my $UNLOCK_OPTIONS = 'asdc:g:vqoV';
 
 use constant {
     PERMS_WORLD_WRITABLE => 0002,
@@ -248,7 +261,7 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $displayed_verbose_group_msg_flag,
     $root_was_ro, $wait_flag, $waiting, $waiting_on_kernel,
     $waiting_on_libs, $start_time, $reason,
-    $force_flag, $audit_flag, $quiet_flag);
+    $force_flag, $audit_flag, $quiet_flag, $operational_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
 
 ### Main program.
@@ -277,6 +290,7 @@ $wait_flag = 0;
 $force_flag = 0;
 $audit_flag = 0;
 $quiet_flag = 0;
+$operational_flag = 0;
 $nonroot_flag = 0;
 
 # Get options.
@@ -309,11 +323,13 @@ $wait_flag       = $opts{'w'};
 $force_flag      = $opts{'f'};
 $audit_flag      = $opts{'a'};
 $quiet_flag      = $opts{'q'};
+$operational_flag = $opts{'o'};
 
 die "Cannot use -a (audit) with -f (force).\n" if ($audit_flag && $force_flag);
 die "Cannot use -a (audit) with -w (wait).\n" if ($audit_flag && $wait_flag);
 die "Cannot use -a (audit) with -v (verbose).\n" if ($audit_flag && $verbose_flag);
 die "Cannot use -q (quiet) without -a (audit).\n" if ($quiet_flag && !$audit_flag);
+die "Cannot use -o (operational) without -a (audit).\n" if ($operational_flag && !$audit_flag);
 die "-w option not supported by your operating system.\n" if ($wait_flag && $^O ne 'openbsd');
 
 # Non-root detection: only meaningful on BSD. Linux non-root is handled
@@ -353,12 +369,13 @@ die "Cannot use -V (version) with other options.\n" if ($opts{'V'} &&
 							 $force_flag ||
 							 $audit_flag ||
 							 $quiet_flag ||
+							 $operational_flag ||
 							 $specified_group_tag ||
 							 $opts{'c'}));
 
 # -V (version).
 if ($opts{'V'}) {
-    print "$VERSION\n";
+    print "$0 $VERSION\n";
     exit;
 }
 
@@ -790,11 +807,12 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 	if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
 	    print "DEBUG: uchg_group_flag=$uchg_group_flag\n" if ($debug_flag);
 	    if ($mode == $LOCK) {
-		if ((!$force_flag && !$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$force_flag)) {
+		if ((!$force_flag && !$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$force_flag && !$audit_flag)) {
 		    die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
 		}
 		elsif ($audit_flag) {
 		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" unless $quiet_flag;
+		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag && !$force_flag) {
@@ -806,7 +824,8 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
 			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
-			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n";
+			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" unless $audit_flag;
+			    print "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" if ($audit_flag && !$quiet_flag);
 			}
 #			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON
 		    }
@@ -816,11 +835,12 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		}
 	    }
 	    else { # mode == UNLOCK
-		if ((!$audit_flag && !$uchg_group_flag) || $schg_group_specified_flag) {
+		if ((!$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$audit_flag)) {
 		    die "System securelevel is $level; sysunlock requires securelevel < 1.\n";
 		}
 		elsif ($audit_flag) {
 		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n" unless $quiet_flag;
+		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag) {
@@ -832,7 +852,8 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
 			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
-			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n";
+			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" unless $audit_flag;
+			    print "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" if ($audit_flag && !$quiet_flag);
 			}
 
 #			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON;
@@ -866,6 +887,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		}
 		elsif ($audit_flag) {
 		    print "System securelevel is $level; syslock requires -f option or securelevel < 1 to set sappnd.\n" unless $quiet_flag;
+		    print "Overriding -o to audit sappnd files as explicitly requested.\n" if ($operational_flag && $sappnd_group_specified_flag && !$quiet_flag);
 		}
 		elsif (!$force_flag) {
 		    # sappnd files will be skipped in the per-file loop.
@@ -878,6 +900,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		}
 		elsif ($audit_flag) {
 		    print "System securelevel is $level; sysunlock requires securelevel < 1 to remove sappnd.\n" unless $quiet_flag;
+		    print "Overriding -o to audit sappnd files as explicitly requested.\n" if ($operational_flag && $sappnd_group_specified_flag && !$quiet_flag);
 		}
 		else {
 		    # sappnd files will be skipped in the per-file loop.
@@ -962,7 +985,8 @@ foreach $file (@files) {
 	# Do NOT set $lock_flag = schg before the securelevel next, or it will
 	# corrupt $lock_flag for subsequent files in the loop.
 	if (grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
-	    next if ((!$force_flag || $mode == $UNLOCK) && $level > 0);
+	    next if ((!$audit_flag || ($operational_flag && !$schg_group_specified_flag))
+		     && (!$force_flag || $mode == $UNLOCK) && $level > 0);
 	    # Only reach here if we're actually going to process this file.
 	    $schg_group_in_use_flag = 1;
 	    # Use schg.
@@ -1027,7 +1051,8 @@ foreach $file (@files) {
     # removal require securelevel < 1 (or -f for setting), mirroring schg.
     if ($sappnd_group_flag) {
 	if (grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @file_group_tags)) {
-	    next if ((!$force_flag || $mode == $UNLOCK) && $level > 0);
+	    next if ((!$audit_flag || ($operational_flag && !$sappnd_group_specified_flag))
+		     && (!$force_flag || $mode == $UNLOCK) && $level > 0);
 	    # Only reach here if we're going to process this file.
 	    $sappnd_group_in_use_flag = 1;
 	    $lock_flag   = $BSD_SYS_APPEND_FLAG_ON;
@@ -1171,6 +1196,16 @@ if ($root_was_ro) {
 # -q (quiet) audit: exit 0 if filesystem matches expected state, 1 if not.
 if ($audit_flag && $quiet_flag) {
     exit ($any_mismatch ? 1 : 0);
+}
+
+# Non-quiet audit: print summary message when all files are in expected state.
+if ($audit_flag && !$any_mismatch) {
+    if ($operational_flag && $level > 0) {
+	print "Audit complete: all actionable files are in the expected state (schg/sappnd files skipped at securelevel $level).\n";
+    }
+    else {
+	print "Audit complete: all files are in the expected state.\n";
+    }
 }
 
 # Subroutine to return 1 if file is in specified group, 0 otherwise.
