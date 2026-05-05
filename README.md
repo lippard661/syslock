@@ -158,7 +158,7 @@ The sample configs define overlapping groups following this pattern:
 - **binaries** — /usr/bin, /usr/sbin, /usr/local/bin, /usr/local/sbin
 - **libraries** — /usr/lib, /usr/libexec, /usr/local/lib, etc.
 - **kernel** — /bsd and kernel relink files
-- **presecure** ? files that if modified could be used before securelevel is raised or prevent securelevel from being raised
+- **presecure** — files that if modified could be used before securelevel is raised or prevent securelevel from being raised
 - **ssl** — /etc/ssl certificate directory
 - **ssh** — /etc/ssh
 - **signify** — /etc/signify key directory
