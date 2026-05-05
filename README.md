@@ -76,10 +76,10 @@ sysunlock -g group[:flag]   Unlock files in named group(s)
 -a                Audit mode: report files that should be locked (syslock)
                   or unlocked (sysunlock) but aren't. Exit 0 if consistent,
                   1 if not.
--o		  Operational scope (with -a only): only audit what would
-		  actually be changed in the circumstance (e.g., ignore
-		  schg groups if system securelevel > 0 on *BSD). If
-		  an schg group is explicitly specified, -o is overridden.
+-o                Operational scope (with -a only): only audit what would
+                  actually be changed in the circumstance (e.g., ignore
+                  schg groups if system securelevel > 0 on *BSD). If
+                  an schg group is explicitly specified, -o is overridden.
 -q                Quiet (with -a only): suppress output, return exit code only.
                   Used by install.pl to verify a group is unlocked before
                   proceeding with installation.
