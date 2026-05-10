@@ -138,6 +138,7 @@ this is how overlapping groups work. Files can appear under multiple
 ```
 +   Do not recurse into subdirectories
 -   Lock/unlock directory contents but not the directory itself
+=   Lock/unlock directory and file contents but not subdirectories
 !   Only operated on by syslock/sysunlock -s (KARL relink files, OpenBSD)
 ```
 

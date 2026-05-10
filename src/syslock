@@ -148,17 +148,6 @@
 #    securelevel, it will require either modifying other scripts that
 #    run earlier to take schg off of rc.securelevel or booting into
 #    Safe Mode.
-#
-#    File paths beginning with a ! will be locked or unlocked when -s
-#    is used (as well as when it is not). File paths without a ! will
-#    not be touched when -s is used. This allows you to put syslock -s
-#    in rc.securelevel and do sysunlock -s after rc.shutdown, so that
-#    files with ! will be unlocked when in single user mode. This was
-#    added to allow shared object library reordering, which occurs on
-#    boot prior to securelevel change. This means all libraries end up
-#    unlocked in single user mode, unless all other libraries are
-#    listed individually, since there's not currently a way to make an
-#    exception within a directory that is otherwise being locked.
 # Modified 3 May 2026 by Claude at the direction of Jim Lippard to fix
 #    -a (audit) incorrectly skipping schg/sappnd files at securelevel > 0
 #    (the per-file next was not guarded by !$audit_flag, causing audit to
@@ -172,6 +161,36 @@
 #    giving an accurate "ready for this operation" answer. Useful for
 #    scripted pre-flight checks, e.g.:
 #      sysunlock -a -q -o -g local && proceed_with_install
+# Modified 10 May 2026 by Claude at the direction of Jim Lippard to fix
+#    tainted readdir()/glob() results being passed to system() under -T
+#    taint mode (affected _recurse_lock_or_unlock, lock/unlock dont_recurse
+#    and dont_lock_top_level_dir blocks, and _audit_file). All readdir/glob
+#    results are now untainted via a safe character regex before use.
+#    Added = path prefix: "lock this directory and its direct file contents
+#    only, skipping subdirectories entirely." Useful when subdirectory
+#    contents are managed by a separate group (e.g. =/boot/grub locks
+#    /boot/grub itself and files directly within it, but not x86_64-efi/,
+#    fonts/, locale/ etc.).
+#    Added _check_ancestor_conflicts(): after config parsing, on BSD when
+#    more than one flag type is in use, warns if any config path would be
+#    processed by an ancestor directory entry using a different flag type.
+#    This detects cases where two groups could set conflicting flags on the
+#    same file (e.g. schg via a parent directory and uchg via an explicit
+#    file entry). Symlinks are skipped with a warning. The prefix flags
+#    (+, -, =) are taken into account to determine whether the ancestor
+#    would actually process the descendant path.
+#
+# Note for OpenBSD:
+#    File paths beginning with a ! will be locked or unlocked when -s
+#    is used (as well as when it is not). File paths without a ! will
+#    not be touched when -s is used. This allows you to put syslock -s
+#    in rc.securelevel and do sysunlock -s after rc.shutdown, so that
+#    files with ! will be unlocked when in single user mode. This was
+#    added to allow shared object library reordering, which occurs on
+#    boot prior to securelevel change. This means all libraries end up
+#    unlocked in single user mode, unless all other libraries are
+#    listed individually, since there's not currently a way to make an
+#    exception within a directory that is otherwise being locked.
 
 ### Required packages.
 
@@ -191,7 +210,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.16 of 4 May 2026';
+my $VERSION = '1.17 of 10 May 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -237,7 +256,7 @@ use constant {
 
 ### Global variables.
 
-my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
+my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %files_only, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
     @uchg_group_tags, @schg_group_tags, @uappnd_group_tags, @sappnd_group_tags);
 
 my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
@@ -583,7 +602,7 @@ while (<CONFIG>) {
     elsif (/^group:/) {
 	die "Invalid characters in \"group:\" tag. $_\n";
     }
-    elsif (/^([\-\+!])(.*)/) {
+    elsif (/^([\-\+!=])(.*)/) {
 	$options = $1;
 	$path = $2;
 	if ($path =~ /[*?\[]/) {
@@ -592,13 +611,14 @@ while (<CONFIG>) {
 	    for my $expanded_path (@expanded) {
 		$dont_lock_top_level_dir{$expanded_path} = 1 if ($options =~ /-/);
 		$dont_recurse{$expanded_path} = 1           if ($options =~ /\+/);
+		$files_only{$expanded_path} = 1             if ($options eq '=');
 		$singleuser_unlocked{$expanded_path} = 1    if ($options =~ /!/);
 		push (@files, $expanded_path);
 		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
 	    }
 	}
 	else {
-	    $path = _file_warnings ($path); # get untainted path back
+	    $path = _file_warnings ($path, $options); # get untainted path back
 	    
 	    if ($options =~ /-/) {
 		$dont_lock_top_level_dir{$path} = 1;
@@ -607,6 +627,10 @@ while (<CONFIG>) {
 	    if ($options =~ /\+/) {
 		$dont_recurse{$path} = 1;
 		print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
+	    }
+	    if ($options eq '=') {
+		$files_only{$path} = 1;
+		print "DEBUG: files_only: $path\n" if ($debug_flag);
 	    }
 	    if ($options =~ /!/) {
 		$singleuser_unlocked{$path} = 1;
@@ -647,6 +671,19 @@ $sappnd_group_in_use_flag = 0;
 # restore branch to reset $lock_flag when no uchg/schg block fired.
 my $global_lock_flag   = $lock_flag;
 my $global_unlock_flag = $unlock_flag;
+
+# Check for ancestor/descendant conflicts where the same file path could
+# be processed by two different groups using different flag types.
+# Only meaningful on BSD where multiple flag types exist.
+{
+    my %flag_types_in_use;
+    $flag_types_in_use{$lock_flag} = 1;
+    $flag_types_in_use{$BSD_SYS_IMMUTABLE_FLAG_ON}  = 1 if $schg_group_flag;
+    $flag_types_in_use{$BSD_USER_IMMUTABLE_FLAG_ON} = 1 if $uchg_group_flag;
+    $flag_types_in_use{$BSD_SYS_APPEND_FLAG_ON}     = 1 if $sappnd_group_flag;
+    $flag_types_in_use{$BSD_USER_APPEND_FLAG_ON}    = 1 if $uappnd_group_flag;
+    _check_ancestor_conflicts() if ($bsd && keys %flag_types_in_use > 1);
+}
 
 # Make sure specified group tag exists.
 #
@@ -1085,18 +1122,36 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is unlocked that would be locked by command.
-		$any_mismatch |= _audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		$any_mismatch |= _audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
 	    }
 	    elsif (-d $file) {
-		if ($dont_recurse{$file}) {
+		if ($files_only{$file}) {
+		    # Lock the directory itself and direct file contents only,
+		    # skipping subdirectories entirely.
+		    print "locking $file (files only)\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
+			next unless $entry =~ /^([-\w.+]+)$/;
+			my $clean_entry = "$file/$1";
+			next if -d $clean_entry;  # skip subdirectories
+			system (@lock_command, $lock_flag, $clean_entry);
+		    }
+		    system (@lock_command, $lock_flag, $file);
+		}
+		elsif ($dont_recurse{$file}) {
 		    print "locking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			next unless -e $entry;
-			system (@lock_command, $lock_flag, $entry);
+			next unless $entry =~ /^([-\w.+]+)$/;
+			my $clean_entry = "$file/$1";
+			next unless -e $clean_entry;
+			system (@lock_command, $lock_flag, $clean_entry);
 		    }
 		    print "locking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
 		    system (@lock_command, $lock_flag, $file) unless $dont_lock_top_level_dir{$file};
@@ -1108,7 +1163,8 @@ foreach $file (@files) {
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			_recurse_lock_or_unlock ($entry, $lock_flag);
+			next unless $entry =~ /^([-\w.+]+)$/;
+			_recurse_lock_or_unlock ("$file/$1", $lock_flag);
 		    }
 		}
 		else {
@@ -1143,25 +1199,44 @@ foreach $file (@files) {
 	    }
 	    if ($audit_flag) {
 		# Report on what is locked that would be unlocked by command.
-		$any_mismatch |= _audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file});
+		$any_mismatch |= _audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
 	    }
 	    elsif (-d $file) {
-		if ($dont_recurse{$file}) {
+		if ($files_only{$file}) {
+		    # Unlock the directory itself and direct file contents only,
+		    # skipping subdirectories entirely.
+		    print "unlocking $file (files only)\n" if ($verbose_flag);
+		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
+			next unless $entry =~ /^([-\w.+]+)$/;
+			my $clean_entry = "$file/$1";
+			next if -d $clean_entry;  # skip subdirectories
+			system (@lock_command, $unlock_flag, $clean_entry);
+		    }
+		    system (@lock_command, $unlock_flag, $file);
+		}
+		elsif ($dont_recurse{$file}) {
 		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		    print "unlocking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
-			next unless -e $entry;
-			system (@lock_command, $unlock_flag, $entry);
+			next unless $entry =~ m{^([-\w./+]+)$};
+			my $clean_entry = $1;
+			next unless -e $clean_entry;
+			system (@lock_command, $unlock_flag, $clean_entry);
 		    }
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively unlocking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
 		    foreach my $entry (glob("$file/*")) {
-			_recurse_lock_or_unlock ($entry, $lock_flag);
+			next unless $entry =~ m{^([-\w./+]+)$};
+			_recurse_lock_or_unlock ($1, $unlock_flag);
 		    }
 		}
 		else {
@@ -1205,6 +1280,83 @@ if ($audit_flag && !$any_mismatch) {
     }
     else {
 	print "Audit complete: all files are in the expected state.\n";
+    }
+}
+
+# Subroutine to return the effective BSD flag type for a path based on
+# its group tags, falling back to the global lock flag.
+sub _effective_flag_type {
+    my ($path) = @_;
+    my $tags = $group_tags{$path} // '';
+    my @tag_list = split (/\s+/, $tags);
+    return $BSD_SYS_IMMUTABLE_FLAG_ON  if grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/,  @tag_list);
+    return $BSD_USER_IMMUTABLE_FLAG_ON if grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @tag_list);
+    return $BSD_SYS_APPEND_FLAG_ON     if grep (/^$BSD_SYS_APPEND_FLAG_ON$/,     @tag_list);
+    return $BSD_USER_APPEND_FLAG_ON    if grep (/^$BSD_USER_APPEND_FLAG_ON$/,     @tag_list);
+    return $global_lock_flag;
+}
+
+# Subroutine to detect ancestor/descendant conflicts: cases where the same
+# file path would be processed by two config entries using different flag
+# types, which could result in multiple flags being set on the same file.
+# Only called on BSD when more than one flag type is in use.
+# Warns for each conflict found; does not die, to allow the admin to
+# decide whether the overlap is intentional (e.g. harmless on Linux-style
+# configs accidentally used on BSD).
+sub _check_ancestor_conflicts {
+    # Build a hash of config paths for O(1) ancestor lookup.
+    my %path_in_config;
+    for my $p (@files) {
+        $path_in_config{$p} = 1;
+    }
+
+    for my $file (@files) {
+        # Skip symlinks -- ancestor detection through symlinks is unreliable.
+        if (-l $file) {
+            print "Warning: $file is a symlink; ancestor conflict check skipped.\n";
+            next;
+        }
+
+        my $file_flag = _effective_flag_type ($file);
+
+        # Walk up the directory tree checking each ancestor.
+        my $ancestor = $file;
+        while ($ancestor =~ s{/[^/]+$}{} && $ancestor ne '') {
+            next unless $path_in_config{$ancestor};
+
+            my $ancestor_flag = _effective_flag_type ($ancestor);
+
+            # Only a conflict if flag types differ.
+            next if $ancestor_flag eq $file_flag;
+
+            # Determine whether the ancestor's prefix would actually
+            # cause it to process $file.
+            my $would_process = 0;
+            my $is_direct_child = ($file =~ m{^\Q$ancestor\E/[^/]+$});
+
+            if ($files_only{$ancestor}) {
+                # = prefix: only direct non-directory children.
+                $would_process = ($is_direct_child && !-d $file);
+            }
+            elsif ($dont_recurse{$ancestor}) {
+                # + prefix: only direct children (files and dirs).
+                $would_process = $is_direct_child;
+            }
+            elsif ($dont_lock_top_level_dir{$ancestor}) {
+                # - prefix: all contents recursively.
+                $would_process = 1;
+            }
+            else {
+                # No prefix: all contents recursively.
+                $would_process = 1;
+            }
+
+            if ($would_process) {
+                print "Warning: $file (flag type: $file_flag) would also be " .
+                      "processed by ancestor $ancestor (flag type: $ancestor_flag). " .
+                      "Both flags could be set on the same path.\n";
+            }
+        }
     }
 }
 
@@ -1253,7 +1405,7 @@ sub _in_group {
 # Subroutine to warn about unusual characters or nonexistent file paths in config
 # and to untaint the result.
 sub _file_warnings {
-    my ($path) = @_;
+    my ($path, $options) = @_;  # $options is optional; passed when a prefix char was used
     
     if ($path =~ /[;&|`\$\(\)<>]/) {
         die "Shell metacharacters in config file path not allowed. $path\n";
@@ -1287,6 +1439,10 @@ sub _file_warnings {
     # Warn about symlinks.
     if ($linux && -l $clean_path) {
 	print "Warning: File path in config is a symlink. $clean_path\n";
+    }
+    # Warn if a directory-only prefix (+, -, =) is used on a non-directory path.
+    if (defined $options && $options =~ /[-+=]/ && -e $clean_path && !-d $clean_path) {
+	print "Warning: prefix '$options' has no effect on non-directory path $clean_path\n";
     }
     # For non-root BSD users, warn if the file is not owned by the invoking user.
     if ($nonroot_flag && -e $clean_path) {
@@ -1385,7 +1541,7 @@ sub _expand_glob {
             print "Warning: Glob pattern matched directory, skipping. $match\n";
             next;
         }
-        my $clean_match = _file_warnings ($match);
+        my $clean_match = _file_warnings ($match, $prefix_opts);
         push (@results, $clean_match);
         print "DEBUG: glob expanded: $full_pattern -> $clean_match\n" if ($debug_flag);
     }
@@ -1525,7 +1681,12 @@ sub _recurse_lock_or_unlock {
 	opendir (my $dh, $path) or return;
 	my @entries = grep(!/^\.$|^\.\.$/, readdir($dh));
 	closedir ($dh);
-	_recurse_lock_or_unlock ("$path/$_", $flag) for @entries;
+	for (@entries) {
+	    # Untaint readdir() results before constructing paths for system().
+	    next unless /^([-\w.+]+)$/;
+	    my $entry = $1;
+	    _recurse_lock_or_unlock ("$path/$entry", $flag);
+	}
 	system (@lock_command, $flag, $path);
     }
     elsif (-e $path) {
@@ -1537,7 +1698,7 @@ sub _recurse_lock_or_unlock {
 # (This currently only looks at the specific flag for BSD, schg/uchg/uappnd,
 # and will call it "unlocked" if it's only locked with the one not checked.)
 sub _audit_file {
-    my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $recurse_level) = @_;
+    my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $files_only_flag, $recurse_level) = @_;
     my ($flags, $desired_state, @subfiles, $subfile, $printed_something, $spaces);
     my $found_mismatch = 0;
 
@@ -1593,6 +1754,9 @@ sub _audit_file {
 	closedir (DIR);
 
 	foreach $subfile (@subfiles) {
+	    # Untaint readdir() result.
+	    next unless $subfile =~ /^([-\w.+]+)$/;
+	    $subfile = $1;
 	    if ($linux && ((-l "$file/$subfile") ||
 		(-c "$file/$subfile") ||
 		(_on_nonstd_fs ("$file/$subfile")))) {
@@ -1600,10 +1764,14 @@ sub _audit_file {
 		# non-standard mounted filesystems.
 		next;
 	    }
+	    # files_only: skip subdirectories entirely.
+	    elsif (-d "$file/$subfile" && $files_only_flag) {
+		next;
+	    }
 	    # If we need to recurse.
 	    elsif (-d "$file/$subfile" && !$dont_recurse_flag) {
 		$recurse_level++;
-		$found_mismatch |= _audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, $recurse_level);
+		$found_mismatch |= _audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, 0, $recurse_level);
 		$recurse_level--;
 	    }
 	    elsif ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag)) {

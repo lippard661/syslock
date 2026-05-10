@@ -1,3 +1,8 @@
+(Done 1.17) Added = prefix (lock/unlock this directory and its
+contents but not subdirectories), example in Linux sample config.
+Fixed taint bug on files with options, added warnings for options
+used on non-directories that aren't meaningful and are ignored.
+
 (Done 1.16): Added -o (operational scope) to limit -a (audit) to
 what can actually change in the given circumstance (based on system
 securelevel). Is effective no-op if securelevel=0; ignores schg
