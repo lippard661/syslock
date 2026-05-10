@@ -179,6 +179,10 @@
 #    file entry). Symlinks are skipped with a warning. The prefix flags
 #    (+, -, =) are taken into account to determine whether the ancestor
 #    would actually process the descendant path.
+# Modified 10 May 2026 by Jim Lippard to modify unveil permissions on
+#    commands from x to rx since the r is required for -a (audit).
+#    Modified the permissions on / to be rx for audit or rw for making
+#    changes.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -400,23 +404,30 @@ if ($opts{'V'}) {
 
 # Pledge and unveil.
 if ($^O eq 'openbsd') {
+    # Most commands need only r for -a audit and x otherwise.
+    my $cmd_perms = $audit_flag ? 'r' : 'x'; # $BSD_MOUNT_COMMAND and $ECHO
+    # Some need to need rx for -a audit and x otherwise.
+    my $exec_perms = $audit_flag ? 'rx' : 'x'; # $LS, $SYSCTL (executed during -a)
     unveil ($config_file, 'r') || die "Cannot unveil config file. $!\n";
+    # $BSD_LOCK_COMMAND always needs r so we can see if it exists.
     unveil ($BSD_LOCK_COMMAND, 'rx') || die "Cannot unveil BSD lock command (chflags). $!\n";
     my $LS = '/bin/ls';
-    unveil ($LS, 'x') || die "Cannot unveil ls. $!\n";
-    unveil ($BSD_MOUNT_COMMAND, 'x') || die "Cannot unveil BSD mount command. $!\n";
-    unveil ($SYSCTL, 'x') || die "Cannot unveil sysctl. $!\n";
+    unveil ($LS, $exec_perms) || die "Cannot unveil ls. $!\n";
+    # $BSD_MOUNT_COMMAND needs r for being audited and x for being run, which it isn't during audit.
+    unveil ($BSD_MOUNT_COMMAND, $cmd_perms) || die "Cannot unveil BSD mount command. $!\n";
+    unveil ($SYSCTL, $exec_perms) || die "Cannot unveil sysctl. $!\n";
     if ($debug_flag) {
-	unveil ($ECHO, 'x') || die "Cannot unveil echo. $!\n";
+	unveil ($ECHO, $cmd_perms) || die "Cannot unveil echo. $!\n";
     }
 
-    if ($wait_flag) {
+    if ($wait_flag) { # mutually inconsistent with -a, so no read on commands, just dir
 	unveil ($PS, 'x') || die "Cannot unveil ps. $!\n";
 	unveil ($REORDER_KERNEL, 'x') || die "Cannot unveil reorder_kernel. $!\n";
 	unveil ($RELINK_DIR, 'r') || die "Cannot unveil relink dir. $!\n";
     }
-    
-    unveil ('/', 'rw') || die "Cannot unveil /. $!\n";
+
+    my $root_perms = $audit_flag ? 'rx' : 'rw';
+    unveil ('/', $root_perms) || die "Cannot unveil /. $!\n";
     unveil () || die "Cannot lock unveil. $!\n";
     
     # stdio included. do we need ps? nope.
