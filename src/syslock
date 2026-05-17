@@ -188,6 +188,8 @@
 #    bareword filehandles, ignore links and character files for any OS,
 #    not just Linux, be more restrictive on unveiling, and switch to
 #    block form greps; all but last suggested by Gemini security assessment.
+# Modified 17 May 2026 by Jim Lippard to fix operator precedence error
+#    introduced in _desired_flag_mismatch by last prior change.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -1660,16 +1662,16 @@ sub _desired_flag_mismatch {
 	    # is present, OR if any other locking flag is present -- a file
 	    # locked by any means cannot be written to regardless of which
 	    # specific flag syslock manages.
-	    return 0 unless grep { $_ eq $bare_flag } @flag_list ||
-			    grep { my $f = $_; grep(/^$f$/, @flag_list) } @all_lock_flags;
+	    return 0 unless (grep { $_ eq $bare_flag } @flag_list) ||
+			    (grep { my $f = $_; grep(/^$f$/, @flag_list) } @all_lock_flags);
 	}
 	else {
 	    # Desired: flag SHOULD be set. No mismatch only if the expected
 	    # flag is present AND no other locking flag is also present
 	    # (an unexpected additional constraint is also a discrepancy).
-	    return 0 if  grep { $_ eq $desired_flag } @flag_list &&
-			!grep { my $f = $_; $f ne $desired_flag &&
-				grep { $_ eq $f } @flag_list } @all_lock_flags;
+	    return 0 if  (grep { $_ eq $desired_flag } @flag_list) &&
+			!(grep { my $f = $_; $f ne $desired_flag &&
+				grep { $_ eq $f } @flag_list } @all_lock_flags);
 	}
 	# Return the full flags string so audit output is informative.
 	return $flags;
