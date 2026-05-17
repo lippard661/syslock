@@ -1,3 +1,10 @@
+(Done 1.18) Avoid TOCTOU by checkng config file permissions with
+file handle after open, use $fh format opens instead of bareword
+filehandles throughout, ignore links and character files for any
+OS, not just Linux, be more restrictive on unveiling when making
+changes, and switch to block form greps throughout. All but last
+suggested by Gemini security assessment.
+
 (Done 1.17) Added = prefix (lock/unlock this directory and its
 contents but not subdirectories), example in Linux sample config.
 Fixed taint bug on files with options, added warnings for options

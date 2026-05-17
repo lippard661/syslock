@@ -183,6 +183,11 @@
 #    commands from x to rx since the r is required for -a (audit).
 #    Modified the permissions on / to be rx for audit or rw for making
 #    changes.
+# Modified 16 May 2026 by Jim Lippard to do config file permissions tests
+#    after file open (avoid TOCTOU), use $fh format opens instead of
+#    bareword filehandles, ignore links and character files for any OS,
+#    not just Linux, be more restrictive on unveiling, and switch to
+#    block form greps; all but last suggested by Gemini security assessment.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -214,7 +219,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.17 of 10 May 2026';
+my $VERSION = '1.18 of 17 May 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -426,12 +431,16 @@ if ($^O eq 'openbsd') {
 	unveil ($RELINK_DIR, 'r') || die "Cannot unveil relink dir. $!\n";
     }
 
-    my $root_perms = $audit_flag ? 'rx' : 'rw';
-    unveil ('/', $root_perms) || die "Cannot unveil /. $!\n";
-    unveil () || die "Cannot lock unveil. $!\n";
+    # All that's needed for audit. If making changes we'll do more unveiling after
+    # getting the files from the config file.
+    unveil ('/', 'rx');
+    if ($audit_flag) {
+	unveil ();
+    }
     
-    # stdio included. do we need ps? nope.
+    # stdio included automatically.
     my @promises = ('rpath', 'wpath', 'fattr', 'exec', 'proc');
+    push (@promises, 'unveil') unless $audit_flag;
     pledge (@promises) || die "Cannot pledge promises. $!\n";
 }
 
@@ -479,19 +488,26 @@ if ($debug_flag) {
     unshift (@lock_command, $ECHO);
 }
 
-# Verify config file is root-owned and not world-writable
-my @stat = stat ($config_file);
+print "DEBUG: opening config file\n" if ($debug_flag);
+open (my $config_fh, '<', $config_file) || die "Cannot open config file. $config_file\n";
+
+# Verify config file is root-owned and not world-writable after open
+# to avoid TOCTOU race.
+my @stat = stat ($config_fh);
 if (!@stat) {
+    close ($config_fh);
     die "Cannot stat config file $config_file: $!\n";
 }
 
 my ($file_mode, $uid) = @stat[2, 4];
 
 if ($uid != UID_ROOT && $uid != $>) {
+    close ($config_fh);
     die "Config file $config_file must be owned by root or the invoking user (currently uid $uid)\n";
 }
 
 if ($file_mode & PERMS_WORLD_WRITABLE) {  # World-writable
+    close ($config_fh);
     die "Config file $config_file must not be world-writable\n";
 }
 
@@ -503,9 +519,7 @@ if ($file_mode & PERMS_GROUP_WRITABLE) {  # Group-writable
     warn "Warning: Config file $config_file is group-writable\n";
 }
 
-print "DEBUG: opening config file\n" if ($debug_flag);
-open (CONFIG, '<', $config_file) || die "Cannot open config file. $config_file\n";
-while (<CONFIG>) {
+while (<$config_fh>) {
     chomp;
     if (/^\s*$|^\s*#/) { # Comment or blank space.
     }
@@ -540,14 +554,14 @@ while (<CONFIG>) {
 	$current_group_tags = $1;
 	print "DEBUG: current_group_tags = $current_group_tags\n" if ($debug_flag);
 	@new_group_tags = split (/\s+/, $current_group_tags);
-	if ($bsd && grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @new_group_tags)) {
+	if ($bsd && grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @new_group_tags) {
 	    $uchg_group_flag = 1;
 	    $uchg_group_in_use_flag = 1;
 	}
 	else {
 	    $uchg_group_in_use_flag = 0;
 	}
-	if ($bsd && grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @new_group_tags)) {
+	if ($bsd && grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @new_group_tags) {
 	    die "Cannot use both $BSD_USER_IMMUTABLE_FLAG_ON and $BSD_SYS_IMMUTABLE_FLAG_ON groups in combination. $_\n" if ($uchg_group_in_use_flag);
 	    die "Non-root users may not use schg groups. $_\n" if ($nonroot_flag);
 
@@ -558,14 +572,14 @@ while (<CONFIG>) {
 	    $schg_group_in_use_flag = 0;
 	}
 	# Detect BSD uappnd group tag.
-	if ($bsd && grep (/^$BSD_USER_APPEND_FLAG_ON$/, @new_group_tags)) {
+	if ($bsd && grep { $_ eq $BSD_USER_APPEND_FLAG_ON } @new_group_tags) {
 	    die "Cannot combine $BSD_USER_APPEND_FLAG_ON with $BSD_USER_IMMUTABLE_FLAG_ON or $BSD_SYS_IMMUTABLE_FLAG_ON in the same group. $_\n"
 		if ($uchg_group_in_use_flag || $schg_group_in_use_flag);
 	    $uappnd_group_flag = 1;
 	    $uappnd_group_in_use_flag = 1;
 	}
 	# Detect BSD sappnd group tag.
-	elsif ($bsd && grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @new_group_tags)) {
+	elsif ($bsd && grep { $_ eq $BSD_SYS_APPEND_FLAG_ON } @new_group_tags) {
 	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_IMMUTABLE_FLAG_ON or $BSD_SYS_IMMUTABLE_FLAG_ON in the same group. $_\n"
 		if ($uchg_group_in_use_flag || $schg_group_in_use_flag);
 	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_APPEND_FLAG_ON in the same group. $_\n"
@@ -575,7 +589,7 @@ while (<CONFIG>) {
 	    $sappnd_group_in_use_flag = 1;
 	}
 	# Detect Linux +a group tag.
-	elsif ($linux && grep (/^\+a$/, @new_group_tags)) {
+	elsif ($linux && grep { $_ eq '+a' } @new_group_tags) {
 	    $uappnd_group_flag = 1;
 	    $uappnd_group_in_use_flag = 1;
 	}
@@ -605,7 +619,7 @@ while (<CONFIG>) {
 	    push (@sappnd_group_tags, $group_tag) if ($bsd &&
 						      $sappnd_group_in_use_flag &&
 						      $group_tag ne $BSD_SYS_APPEND_FLAG_ON);
-	    if (!grep (/^\Q$group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $group_tag } @all_group_tags) {
 		push (@all_group_tags, $group_tag);
 	    }
 	}
@@ -667,7 +681,7 @@ while (<CONFIG>) {
 	}
     }
 }
-close (CONFIG);
+close ($config_fh);
 print "DEBUG: closing config file\n" if ($debug_flag);
 
 # Reset per-group-line in-use flags that were left set by config parsing.
@@ -727,10 +741,10 @@ if ($specified_group_tag) {
     if ($bsd && $specified_group_tag =~ /^$BSD_USER_IMMUTABLE_FLAG_ON$|^(.*):$BSD_USER_IMMUTABLE_FLAG_ON$/) {
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
+	    elsif (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -742,7 +756,7 @@ if ($specified_group_tag) {
 	    }
 
 	    # Must be at least one group using $BSD_USER_IMMUTABLE_FLAG_ON (if they aren't already all implicit).
-	    if ($lock_flag ne $BSD_USER_IMMUTABLE_FLAG_ON && !grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+	    if ($lock_flag ne $BSD_USER_IMMUTABLE_FLAG_ON && !grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	}
@@ -751,10 +765,10 @@ if ($specified_group_tag) {
     elsif ($bsd && $specified_group_tag =~ /^$BSD_SYS_IMMUTABLE_FLAG_ON$|^(.*):$BSD_SYS_IMMUTABLE_FLAG_ON$/) {
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^\Q$specified_group_tag\E$/, @schg_group_tags)) {
+	    elsif (!grep { $_ eq $specified_group_tag } @schg_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -766,7 +780,7 @@ if ($specified_group_tag) {
 	    }
 
 	    # Must be at least one group with $BSD_SYS_IMMUTABLE_FLAG_ON (if they aren't already all implicit).
-	    if ($lock_flag ne $BSD_SYS_IMMUTABLE_FLAG_ON && !grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @all_group_tags)) {
+	    if ($lock_flag ne $BSD_SYS_IMMUTABLE_FLAG_ON && !grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	}
@@ -776,10 +790,10 @@ if ($specified_group_tag) {
 	$uappnd_group_specified_flag = 1;
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uappnd_group_tags)) {
+	    elsif (!grep { $_ eq $specified_group_tag } @uappnd_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_APPEND_FLAG_ON\".\n";
 	    }
 	}
@@ -792,10 +806,10 @@ if ($specified_group_tag) {
 	$uappnd_group_specified_flag = 1;
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^\Q$specified_group_tag\E$/, @uappnd_group_tags)) {
+	    elsif (!grep { $_ eq $specified_group_tag } @uappnd_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"+a\".\n";
 	    }
 	}
@@ -809,10 +823,10 @@ if ($specified_group_tag) {
 	$sappnd_group_specified_flag = 1;
 	if (defined ($1)) {
 	    $specified_group_tag = $1;
-	    if (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+	    if (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
-	    elsif (!grep (/^\Q$specified_group_tag\E$/, @sappnd_group_tags)) {
+	    elsif (!grep { $_ eq $specified_group_tag } @sappnd_group_tags) {
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_APPEND_FLAG_ON\".\n";
 	    }
 	}
@@ -820,7 +834,7 @@ if ($specified_group_tag) {
 	    die "No \"$BSD_SYS_APPEND_FLAG_ON\" group tag found in config.\n";
 	}
     }
-    elsif (!grep (/^\Q$specified_group_tag\E$/, @all_group_tags)) {
+    elsif (!grep { $_ eq $specified_group_tag } @all_group_tags) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
@@ -871,7 +885,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    }
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
-			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
+			if (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
 			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" unless $audit_flag;
 			    print "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" if ($audit_flag && !$quiet_flag);
 			}
@@ -899,7 +913,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    }
 		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
 			# Can't implicitly add :uchg if there's no such group.
-			if (!grep (/^\Q$specified_group_tag\E$/, @uchg_group_tags)) {
+			if (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
 			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" unless $audit_flag;
 			    print "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" if ($audit_flag && !$quiet_flag);
 			}
@@ -965,20 +979,20 @@ if ($wait_flag) {
     $start_time = time();
     while ($waiting) {
 	# check on library randomization (unlikely to ever be useful since rc.securelevel runs after this is done)
-	opendir (DIR, $RELINK_DIR) || die "Cannot check for library randomization. $!\n";
-	$waiting_on_libs = grep (/^$REBUILD_PREFIX\.\w+$/, readdir (DIR));
-	closedir (DIR);
+	opendir (my $dir_fh, $RELINK_DIR) || die "Cannot check for library randomization. $!\n";
+	$waiting_on_libs = grep (/^$REBUILD_PREFIX\.\w+$/, readdir ($dir_fh));
+	closedir ($dir_fh);
 
 	# check on kernel reordering (assumes syslock runs after kernel reordering has begun)
-	open (CHECKPS, '-|', "$PS -auwx") || die "Cannot check for kernel reordering. $!\n";
+	open (my $checkps_fh, '-|', "$PS -auwx") || die "Cannot check for kernel reordering. $!\n";
 	$waiting_on_kernel = 0;
-	while (<CHECKPS>) {
+	while (<$checkps_fh>) {
 	    if (/$REORDER_KERNEL/) {
 		$waiting_on_kernel = 1;
 		last;
 	    }
 	}
-	close (CHECKPS);
+	close ($checkps_fh);
 
 	$waiting = $waiting_on_kernel || $waiting_on_libs;
 	$reason = sprintf "%s%s%s", $waiting_on_kernel ? 'kernel reordering' : '', ($waiting_on_kernel && $waiting_on_libs) ? ' and ' : '', $waiting_on_libs ? 'library randomization' : '';
@@ -1005,20 +1019,30 @@ if (!$audit_flag && _root_ro()) {
 # Accumulates whether any audit mismatch was found; used by -q exit code.
 my $any_mismatch = 0;
 
+# Finish unveiling if not auditing. This is still a bit overpermissive
+# if an individual group has been specified.
+if ($^O eq 'openbsd' && !$audit_flag) {
+    foreach $file (@files) {
+	unveil ($file, 'rw');
+    }
+    # Lock any further unveiling.
+    unveil ();
+}
+
 foreach $file (@files) {
     @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag || $sappnd_group_flag);
 
     # uchg group is in config
     if ($uchg_group_flag) {
 	# If file is in uchg group, temporarily change how we lock and unlock.
-	if (grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	if (grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @file_group_tags) {
 	    $uchg_group_in_use_flag = 1;
 	    # Use uchg.
 	    $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
 	    $unlock_flag = "no$lock_flag";
 	}
 	# Restore if it's not.
-	elsif ($uchg_group_in_use_flag && grep (!/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	elsif ($uchg_group_in_use_flag && !grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @file_group_tags) {
 	    # Use schg.
 	    $uchg_group_in_use_flag = 0;
 	    $lock_flag = $BSD_SYS_IMMUTABLE_FLAG_ON;
@@ -1032,7 +1056,7 @@ foreach $file (@files) {
 	# If file is in schg group, check securelevel before changing $lock_flag.
 	# Do NOT set $lock_flag = schg before the securelevel next, or it will
 	# corrupt $lock_flag for subsequent files in the loop.
-	if (grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	if (grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @file_group_tags) {
 	    next if ((!$audit_flag || ($operational_flag && !$schg_group_specified_flag))
 		     && (!$force_flag || $mode == $UNLOCK) && $level > 0);
 	    # Only reach here if we're actually going to process this file.
@@ -1042,7 +1066,7 @@ foreach $file (@files) {
 	    $unlock_flag = "no$lock_flag";
 	}
 	# Restore if it's not.
-	elsif ($schg_group_in_use_flag && grep (!/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)) {
+	elsif ($schg_group_in_use_flag && !grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @file_group_tags) {
 	    # Use uchg.
 	    $schg_group_in_use_flag = 0;
 	    $lock_flag = $BSD_USER_IMMUTABLE_FLAG_ON;
@@ -1062,7 +1086,7 @@ foreach $file (@files) {
     # uchg/schg blocks' result stand.
     if ($uappnd_group_flag) {
 	my $append_tag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '\+a';
-	if (grep (/^$append_tag$/, @file_group_tags)) {
+	if (grep { $_ eq $append_tag } @file_group_tags) {
 	    $uappnd_group_in_use_flag = 1;
 	    # Switch to append flag.
 	    if ($bsd) {
@@ -1098,7 +1122,7 @@ foreach $file (@files) {
     # sappnd group is in config (BSD only, root only). Both setting and
     # removal require securelevel < 1 (or -f for setting), mirroring schg.
     if ($sappnd_group_flag) {
-	if (grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @file_group_tags)) {
+	if (grep { $_ eq $BSD_SYS_APPEND_FLAG_ON } @file_group_tags) {
 	    next if ((!$audit_flag || ($operational_flag && !$sappnd_group_specified_flag))
 		     && (!$force_flag || $mode == $UNLOCK) && $level > 0);
 	    # Only reach here if we're going to process this file.
@@ -1300,10 +1324,10 @@ sub _effective_flag_type {
     my ($path) = @_;
     my $tags = $group_tags{$path} // '';
     my @tag_list = split (/\s+/, $tags);
-    return $BSD_SYS_IMMUTABLE_FLAG_ON  if grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/,  @tag_list);
-    return $BSD_USER_IMMUTABLE_FLAG_ON if grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @tag_list);
-    return $BSD_SYS_APPEND_FLAG_ON     if grep (/^$BSD_SYS_APPEND_FLAG_ON$/,     @tag_list);
-    return $BSD_USER_APPEND_FLAG_ON    if grep (/^$BSD_USER_APPEND_FLAG_ON$/,     @tag_list);
+    return $BSD_SYS_IMMUTABLE_FLAG_ON  if grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON }  @tag_list;
+    return $BSD_USER_IMMUTABLE_FLAG_ON if grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @tag_list;
+    return $BSD_SYS_APPEND_FLAG_ON     if grep { $_ eq $BSD_SYS_APPEND_FLAG_ON }     @tag_list;
+    return $BSD_USER_APPEND_FLAG_ON    if grep { $_ eq $BSD_USER_APPEND_FLAG_ON }    @tag_list;
     return $global_lock_flag;
 }
 
@@ -1380,7 +1404,7 @@ sub _in_group {
 	@file_group_tags) = @_;
 
     # If it's in the group ...
-    if (grep (/^\Q$specified_group_tag\E$/, @file_group_tags)) {
+    if (grep { $_ eq $specified_group_tag } @file_group_tags) {
 	# and we don't care about uchg, schg, uappnd/+a, or sappnd...
 	return 1 if (!$uchg_group_specified_flag && !$schg_group_specified_flag && !$uappnd_group_specified_flag && !$sappnd_group_specified_flag);
 	# or the specified group is already uchg/schg...
@@ -1397,16 +1421,16 @@ sub _in_group {
 		     $specified_group_tag eq $BSD_SYS_APPEND_FLAG_ON);
 	# or it's also in the uchg/schg group...
 	return 1 if (($uchg_group_specified_flag &&
-		      grep (/^$BSD_USER_IMMUTABLE_FLAG_ON$/, @file_group_tags)) ||
+		      grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @file_group_tags) ||
 		     ($schg_group_specified_flag &&
-		      grep (/^$BSD_SYS_IMMUTABLE_FLAG_ON$/, @file_group_tags)));
+		      grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @file_group_tags));
 	# or it's also in the uappnd/+a group...
 	return 1 if ($uappnd_group_specified_flag &&
-		     (($bsd && grep (/^$BSD_USER_APPEND_FLAG_ON$/, @file_group_tags)) ||
-		      ($linux && grep (/^\+a$/, @file_group_tags))));
+		     (($bsd && grep { $_ eq $BSD_USER_APPEND_FLAG_ON } @file_group_tags) ||
+		      ($linux && grep { $_ eq '+a' } @file_group_tags)));
 	# or it's also in the sappnd group...
 	return 1 if ($sappnd_group_specified_flag &&
-		     grep (/^$BSD_SYS_APPEND_FLAG_ON$/, @file_group_tags));
+		     grep { $_ eq $BSD_SYS_APPEND_FLAG_ON } @file_group_tags);
     }
 
     # Otherwise.
@@ -1576,7 +1600,7 @@ sub _root_ro {
     if ($mount_output =~ /\/.* on \/ type.*\((.*)\)/) {
 	$mount_opts_list = $1;
 	@mount_opts = split (/,/, $mount_opts_list);
-	return 1 if (grep (/^ro$/, @mount_opts));
+	return 1 if (grep { $_ eq 'ro' } @mount_opts);
     }
 
     return 0;
@@ -1636,16 +1660,16 @@ sub _desired_flag_mismatch {
 	    # is present, OR if any other locking flag is present -- a file
 	    # locked by any means cannot be written to regardless of which
 	    # specific flag syslock manages.
-	    return 0 unless grep (/^$bare_flag$/, @flag_list) ||
+	    return 0 unless grep { $_ eq $bare_flag } @flag_list ||
 			    grep { my $f = $_; grep(/^$f$/, @flag_list) } @all_lock_flags;
 	}
 	else {
 	    # Desired: flag SHOULD be set. No mismatch only if the expected
 	    # flag is present AND no other locking flag is also present
 	    # (an unexpected additional constraint is also a discrepancy).
-	    return 0 if  grep (/^$desired_flag$/, @flag_list) &&
+	    return 0 if  grep { $_ eq $desired_flag } @flag_list &&
 			!grep { my $f = $_; $f ne $desired_flag &&
-				grep(/^$f$/, @flag_list) } @all_lock_flags;
+				grep { $_ eq $f } @flag_list } @all_lock_flags;
 	}
 	# Return the full flags string so audit output is informative.
 	return $flags;
@@ -1745,9 +1769,11 @@ sub _audit_file {
     $printed_something = 0;
     $spaces = $recurse_level * 3;
 
-    if ($linux && ((-l $file) || (-c $file) || (_on_nonstd_fs ($file)))) {
+    if (-l $file || -c $file) {
 	print "Warning: ignoring symlink. $file\n" if (-l $file && !$quiet_flag);
 	print "Warning: ignoring special character file. $file\n" if (-c $file && !$quiet_flag);
+    }
+    elsif ($linux && (_on_nonstd_fs ($file))) {
 	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (_on_nonstd_fs ($file) && !$quiet_flag);
     }
     elsif (-d $file) {
@@ -1760,19 +1786,20 @@ sub _audit_file {
 	    }
 	}
 	# Check subdir contents.
-	opendir (DIR, $file) || die "Cannot open directory. $!. $file\n";
-	@subfiles = grep (!/^\.{1,2}$/, readdir (DIR));
-	closedir (DIR);
+	opendir (my $dir_fh, $file) || die "Cannot open directory. $!. $file\n";
+	@subfiles = grep (!/^\.{1,2}$/, readdir ($dir_fh));
+	closedir ($dir_fh);
 
 	foreach $subfile (@subfiles) {
 	    # Untaint readdir() result.
 	    next unless $subfile =~ /^([-\w.+]+)$/;
 	    $subfile = $1;
-	    if ($linux && ((-l "$file/$subfile") ||
-		(-c "$file/$subfile") ||
-		(_on_nonstd_fs ("$file/$subfile")))) {
-		# Ignore links, special character files, and files on
-		# non-standard mounted filesystems.
+	    if (-l "$file/$subfile" || -c "$file/$subfile") {
+		# Ignore links and special character files.
+		next;
+	    }
+	    if ($linux && _on_nonstd_fs ("$file/$subfile")) {
+		# Ignore files on non-standard mounted filesystems.
 		next;
 	    }
 	    # files_only: skip subdirectories entirely.
