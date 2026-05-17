@@ -3,7 +3,10 @@ file handle after open, use $fh format opens instead of bareword
 filehandles throughout, ignore links and character files for any
 OS, not just Linux, be more restrictive on unveiling when making
 changes, and switch to block form greps throughout. All but last
-suggested by Gemini security assessment.
+suggested by Gemini security assessment. Fix bug in block grep
+operator precedence and allow -g <group>:schg -a -q to exit with
+0 if there are no matching schg groups (just uchg; still fails
+if the group doesn't exist at all) -- to be used by install.pl.
 
 (Done 1.17) Added = prefix (lock/unlock this directory and its
 contents but not subdirectories), example in Linux sample config.

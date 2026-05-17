@@ -190,7 +190,9 @@
 #    block form greps; all but last suggested by Gemini security assessment.
 # Modified 17 May 2026 by Jim Lippard to fix operator precedence error
 #    introduced in _desired_flag_mismatch by last prior change. Fix bug
-#    in -a -o processing for schg files on a schg-default system.
+#    in -a -o processing for schg files on a schg-default system. Allow
+#    sysunlock -g <group>:schg -a -q to exit with 0 if there are no
+#    schg members of <group>, to facilitate use by install.pl.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -748,6 +750,9 @@ if ($specified_group_tag) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	    elsif (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
+		if ($audit_flag && $quiet_flag) {
+		    exit 0; # group exists but has no uchg files -- not a blocker
+		}
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -772,6 +777,9 @@ if ($specified_group_tag) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	    elsif (!grep { $_ eq $specified_group_tag } @schg_group_tags) {
+		if ($audit_flag && $quiet_flag) {
+		    exit 0; # group exists but has no schg files -- not a blocker
+		}
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_IMMUTABLE_FLAG_ON\".\n";
 	    }
 
@@ -797,6 +805,9 @@ if ($specified_group_tag) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	    elsif (!grep { $_ eq $specified_group_tag } @uappnd_group_tags) {
+		if ($audit_flag && $quiet_flag) {
+		    exit 0; # group exists but has no uappnd files -- not a blocker
+		}
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_USER_APPEND_FLAG_ON\".\n";
 	    }
 	}
@@ -813,6 +824,9 @@ if ($specified_group_tag) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	    elsif (!grep { $_ eq $specified_group_tag } @uappnd_group_tags) {
+		if ($audit_flag && $quiet_flag) {
+		    exit 0; # group exists but has no +a files -- not a blocker
+		}
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"+a\".\n";
 	    }
 	}
@@ -830,6 +844,9 @@ if ($specified_group_tag) {
 		die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
 	    }
 	    elsif (!grep { $_ eq $specified_group_tag } @sappnd_group_tags) {
+		if ($audit_flag && $quiet_flag) {
+		    exit 0; # group exists but has no sappnd files -- not a blocker
+		}
 		die "Specified group tag \"$specified_group_tag\" doesn't appear with group tag \"$BSD_SYS_APPEND_FLAG_ON\".\n";
 	    }
 	}
@@ -879,11 +896,11 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" unless $quiet_flag;
 		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
 		    # With -o, schg files should be skipped in the per-file loop
-                    # just as they would be in a normal syslock run without -f.
-                    # Set $schg_group_flag so the per-file next guard fires.
-                    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag && !$force_flag) {
-                        $schg_group_flag = 1;
-                    }
+		    # just as they would be in a normal syslock run without -f.
+		    # Set $schg_group_flag so the per-file next guard fires.
+		    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag && !$force_flag) {
+			$schg_group_flag = 1;
+		    }
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag && !$force_flag) {
@@ -912,12 +929,12 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
 		elsif ($audit_flag) {
 		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n" unless $quiet_flag;
 		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
-                    # With -o, schg files should be skipped in the per-file loop
-                    # just as they would be in a normal sysunlock run.
-                    # Set $schg_group_flag so the per-file next guard fires.
-                    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag) {
-                        $schg_group_flag = 1;
-                    }		    
+		    # With -o, schg files should be skipped in the per-file loop
+		    # just as they would be in a normal sysunlock run.
+		    # Set $schg_group_flag so the per-file next guard fires.
+		    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag) {
+			$schg_group_flag = 1;
+		    }
 		}
 		# Implicit uchg group specified.
 		elsif ($uchg_group_flag) {
@@ -1683,8 +1700,8 @@ sub _desired_flag_mismatch {
 	    # flag is present AND no other locking flag is also present
 	    # (an unexpected additional constraint is also a discrepancy).
 	    return 0 if  (grep { $_ eq $desired_flag } @flag_list) &&
-		!(grep { my $f = $_; $f ne $desired_flag &&
-					 (grep { $_ eq $f } @flag_list) } @all_lock_flags);
+			!(grep { my $f = $_; $f ne $desired_flag &&
+				 (grep { $_ eq $f } @flag_list) } @all_lock_flags);
 	}
 	# Return the full flags string so audit output is informative.
 	return $flags;
