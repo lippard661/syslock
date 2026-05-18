@@ -215,7 +215,7 @@ to prioritize ROP reordering or immutability depends on your threat model.
 
 **Log rotation** (add to crontab around newsyslog):
 ```sh
-/usr/local/bin/sysunlock -g newsyslog-logs && /usr/sbin/newsyslog; /usr/local/bin/syslock -g newsyslog-logs
+/usr/local/bin/sysunlock -g newsyslog-logs && /usr/bin/newsyslog; /usr/local/bin/syslock -g newsyslog-logs
 ```
 
 Or to run the relock asynchronously:
