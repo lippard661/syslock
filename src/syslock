@@ -193,6 +193,9 @@
 #    in -a -o processing for schg files on a schg-default system. Allow
 #    sysunlock -g <group>:schg -a -q to exit with 0 if there are no
 #    schg members of <group>, to facilitate use by install.pl.
+# Modified 18 May 2026 by Jim Lippard to fix another bug introduced by
+#    the block grep switch, removing a single backslash from in front
+#    of "+a" which was formerly required for regexp escaping.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -1117,7 +1120,7 @@ foreach $file (@files) {
     # that -- it simply clears $uappnd_group_in_use_flag and lets the
     # uchg/schg blocks' result stand.
     if ($uappnd_group_flag) {
-	my $append_tag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '\+a';
+	my $append_tag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
 	if (grep { $_ eq $append_tag } @file_group_tags) {
 	    $uappnd_group_in_use_flag = 1;
 	    # Switch to append flag.
