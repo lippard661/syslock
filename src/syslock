@@ -196,6 +196,8 @@
 # Modified 18 May 2026 by Jim Lippard to fix another bug introduced by
 #    the block grep switch, removing a single backslash from in front
 #    of "+a" which was formerly required for regexp escaping.
+# Modified 19 May 2026 by Jim Lippard for fast exit with -a -q (as
+#    soon as the first mismatch is found).
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -227,7 +229,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.18 of 17 May 2026';
+my $VERSION = '1.18a of 20 May 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -1193,6 +1195,7 @@ foreach $file (@files) {
 	    if ($audit_flag) {
 		# Report on what is unlocked that would be locked by command.
 		$any_mismatch |= _audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
+		exit 1 if ($quiet_flag && $any_mismatch);
 	    }
 	    elsif (-d $file) {
 		if ($files_only{$file}) {
@@ -1270,6 +1273,7 @@ foreach $file (@files) {
 	    if ($audit_flag) {
 		# Report on what is locked that would be unlocked by command.
 		$any_mismatch |= _audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
+		exit 1 if ($quiet_flag && $any_mismatch);
 	    }
 	    elsif (-d $file) {
 		if ($files_only{$file}) {
@@ -1818,6 +1822,7 @@ sub _audit_file {
 		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 		$printed_something = 1;
 		$found_mismatch = 1;
+		return $found_mismatch if $quiet_flag;
 	    }
 	}
 	# Check subdir contents.
@@ -1846,6 +1851,7 @@ sub _audit_file {
 		$recurse_level++;
 		$found_mismatch |= _audit_file ("$file/$subfile", $desired_flag, $dont_recurse_flag, 0, 0, $recurse_level);
 		$recurse_level--;
+		return $found_mismatch if ($quiet_flag && $found_mismatch);
 	    }
 	    elsif ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
 		if (!$printed_something && !$quiet_flag) {
@@ -1854,6 +1860,7 @@ sub _audit_file {
 		}
 		print ' 'x$spaces, "   $subfile (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 		$found_mismatch = 1;
+		return $found_mismatch if $quiet_flag;
 	    }
 	}
     }
@@ -1862,6 +1869,7 @@ sub _audit_file {
 	if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
 	    print "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 	    $found_mismatch = 1;
+	    return $found_mismatch if $quiet_flag;
 	}
     }
     # If nonexistent, just report that.

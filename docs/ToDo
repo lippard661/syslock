@@ -1,3 +1,6 @@
+(Done 1.18a) Make -a -q much faster (potentially) by exiting at
+first mismatch.
+
 (Done 1.18) Avoid TOCTOU by checkng config file permissions with
 file handle after open, use $fh format opens instead of bareword
 filehandles throughout, ignore links and character files for any
