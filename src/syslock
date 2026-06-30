@@ -1405,9 +1405,13 @@ sub _effective_flag_type {
 # Untaint a directory entry. Returns the untainted name, or warns and
 # returns undef if it contains characters outside our safe set, so an
 # admin knows a listed file was not actually processed.
+# NOTE: This accepts ( ) and & which are still rejected for
+# config-supplied paths in _file_warnings and _expand_glob. If
+# changed for consistency the recommendation would be to remove them
+# from here and not add them there.
 sub _untaint_entry {
     my ($dir, $entry, $no_warn) = @_;
-    return $1 if $entry =~ /^([-\w.+\s,()~!@#%^&=]+)$/;
+    return $1 if $entry =~ /\A([-\w.+ ,()~!@#%^&=]+)\z/;
     warn "Warning: skipping \"$dir/$entry\": filename contains characters outside the safe set; not processed.\n" unless $no_warn;
     return undef;
 }
