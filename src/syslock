@@ -198,6 +198,20 @@
 #    of "+a" which was formerly required for regexp escaping.
 # Modified 19 May 2026 by Jim Lippard for fast exit with -a -q (as
 #    soon as the first mismatch is found).
+# Modified 30 June 2026 by Jim Lippard after Claude Opus 4.8 review:
+#    Fix asymmetry in handling hidden files (previously locked but
+#    not unlocked, now handled), add / target for Linux mount,
+#    don't mess with mount on macOS, use untaint subroutine and
+#    broaden acceptable chars and emit warnings when unacceptable
+#    filenames are hit, fix bug with $bsd flag used before it was
+#    set, avoid unitialized value warnings for files with no group
+#    tags defined, fail closed on securelevel parsing, remove last
+#    remaining shell invocation in wait loop, die instead of warning
+#    if config is group writable, don't use $options variable for two
+#    different purposes, give nonzero exit when bad options are supplied,
+#    return failure exit ($file_mismatch) with -a -q if we hit a file
+#    that can't be untainted due to unacceptable chars in filename
+#    (_untaint_entry).
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -229,7 +243,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.18a of 20 May 2026';
+my $VERSION = '1.19 of 30 June 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -247,8 +261,8 @@ my $BSD_MOUNT_COMMAND = '/sbin/mount';
 my $LINUX_MOUNT_COMMAND = '/usr/bin/mount';
 my @BSD_MOUNT_ARGS = ('-uw', '/');
 my @BSD_MOUNT_RO_ARGS = ('-u', '-o', 'ro', '/');
-my @LINUX_MOUNT_ARGS = ('-o', 'remount,rw');
-my @LINUX_MOUNT_RO_ARGS = ('-o', 'remount,ro');
+my @LINUX_MOUNT_ARGS = ('-o', 'remount,rw', '/');
+my @LINUX_MOUNT_RO_ARGS = ('-o', 'remount,ro', '/');
 my $BSD_LOCK_COMMAND = '/usr/bin/chflags';
 my $LINUX_LOCK_COMMAND = '/usr/bin/chattr';
 my $RECURSE_FLAG = '-R';
@@ -279,7 +293,7 @@ my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %file
     @uchg_group_tags, @schg_group_tags, @uappnd_group_tags, @sappnd_group_tags);
 
 my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
-    $singleuser_flag,
+    $singleuser_flag, $prefix_options,
     $uchg_group_flag, # uchg group exists
     $uchg_group_in_use_flag, # uchg group is used in the section of config or current processing
     $uchg_group_specified_flag, # -g uchg or -g group:uchg
@@ -331,8 +345,11 @@ $quiet_flag = 0;
 $operational_flag = 0;
 $nonroot_flag = 0;
 
+# avoid undef for use cases where it's not read (audit cases)
+$level = 0;
+
 # Get options.
-getopts ($options, \%opts) || exit;
+getopts ($options, \%opts) || exit(1);
 
 if ($#ARGV != -1) {
     if ($mode == $LOCK) {
@@ -344,16 +361,9 @@ if ($#ARGV != -1) {
 }
 
 $specified_group_tag = $opts{'g'};
-$uchg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_USER_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_USER_APPEND_FLAG_ON$/);
-$schg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_SYS_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_SYS_APPEND_FLAG_ON$/);
+# sappnd check here, uappnd check below
 $sappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)$BSD_SYS_APPEND_FLAG_ON$/);
-# uappnd (BSD) or +a (Linux) as suffix or standalone.
-if ($bsd) {
-    $uappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)$BSD_USER_APPEND_FLAG_ON$/);
-}
-else {
-    # On Linux, +a can only appear standalone or as :+a suffix -- handle after OS detection.
-}
+
 $singleuser_flag = $opts{'s'};
 $debug_flag      = $opts{'d'};
 $verbose_flag    = $opts{'v'};
@@ -487,11 +497,20 @@ elsif (-e $LINUX_LOCK_COMMAND) {
     @lock_command = ($LINUX_LOCK_COMMAND, '-f');
     $lock_flag = $LINUX_IMMUTABLE_FLAG_ON;
     $unlock_flag = $LINUX_IMMUTABLE_FLAG_OFF;
-    # Detect +a group specification on Linux now that we know it's Linux.
-    $uappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)\+a$/);
 }
 else {
     die "Immutability flags do not appear to be supported by your system.\n";
+}
+
+if ($bsd) {
+    $uchg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_USER_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_USER_APPEND_FLAG_ON$/);
+    $schg_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /$BSD_SYS_IMMUTABLE_FLAG_ON$/ && $specified_group_tag !~ /$BSD_SYS_APPEND_FLAG_ON$/);
+    $uappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)$BSD_USER_APPEND_FLAG_ON$/);
+    # sappnd group specified check is up above (and used earlier).
+}
+else {
+    # Detect +a group specification on Linux now that we know it's Linux.
+    $uappnd_group_specified_flag = 1 if (defined ($specified_group_tag) && $specified_group_tag =~ /(?:^|:)\+a$/);
 }
 
 if ($debug_flag) {
@@ -521,12 +540,12 @@ if ($file_mode & PERMS_WORLD_WRITABLE) {  # World-writable
     die "Config file $config_file must not be world-writable\n";
 }
 
-if ($file_mode & PERMS_WORLD_READABLE) {  # World-readable
-    warn "Config file $config_file is world-readable; consider chmod 0600.\n";
+if ($file_mode & PERMS_GROUP_WRITABLE) {  # Group-writable
+    die "Config file $config_file must not be group-writable\n";
 }
 
-if ($file_mode & PERMS_GROUP_WRITABLE) {  # Group-writable
-    warn "Warning: Config file $config_file is group-writable\n";
+if ($file_mode & PERMS_WORLD_READABLE) {  # World-readable
+    warn "Config file $config_file is world-readable; consider chmod 0600.\n";
 }
 
 while (<$config_fh>) {
@@ -638,36 +657,36 @@ while (<$config_fh>) {
 	die "Invalid characters in \"group:\" tag. $_\n";
     }
     elsif (/^([\-\+!=])(.*)/) {
-	$options = $1;
+	$prefix_options = $1;
 	$path = $2;
 	if ($path =~ /[*?\[]/) {
 	    # Glob pattern -- expand and register each result.
-	    my @expanded = _expand_glob ($path, $options);
+	    my @expanded = _expand_glob ($path, $prefix_options);
 	    for my $expanded_path (@expanded) {
-		$dont_lock_top_level_dir{$expanded_path} = 1 if ($options =~ /-/);
-		$dont_recurse{$expanded_path} = 1           if ($options =~ /\+/);
-		$files_only{$expanded_path} = 1             if ($options eq '=');
-		$singleuser_unlocked{$expanded_path} = 1    if ($options =~ /!/);
+		$dont_lock_top_level_dir{$expanded_path} = 1 if ($prefix_options =~ /-/);
+		$dont_recurse{$expanded_path} = 1           if ($prefix_options =~ /\+/);
+		$files_only{$expanded_path} = 1             if ($prefix_options eq '=');
+		$singleuser_unlocked{$expanded_path} = 1    if ($prefix_options =~ /!/);
 		push (@files, $expanded_path);
 		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
 	    }
 	}
 	else {
-	    $path = _file_warnings ($path, $options); # get untainted path back
+	    $path = _file_warnings ($path, $prefix_options); # get untainted path back
 	    
-	    if ($options =~ /-/) {
+	    if ($prefix_options =~ /-/) {
 		$dont_lock_top_level_dir{$path} = 1;
 		print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
 	    }
-	    if ($options =~ /\+/) {
+	    if ($prefix_options =~ /\+/) {
 		$dont_recurse{$path} = 1;
 		print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
 	    }
-	    if ($options eq '=') {
+	    if ($prefix_options eq '=') {
 		$files_only{$path} = 1;
 		print "DEBUG: files_only: $path\n" if ($debug_flag);
 	    }
-	    if ($options =~ /!/) {
+	    if ($prefix_options =~ /!/) {
 		$singleuser_unlocked{$path} = 1;
 		print "DEBUG: singleuser_unlocked: $path\n" if ($debug_flag);
 	    }
@@ -881,6 +900,7 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
     else {
 	$level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
     }
+    die "Cannot identify system securelevel. $level\n" if ($level !~ /^\d+/);
 
     # Warnings and errors.
     if ($level > 0) {
@@ -1021,7 +1041,7 @@ if ($wait_flag) {
 	closedir ($dir_fh);
 
 	# check on kernel reordering (assumes syslock runs after kernel reordering has begun)
-	open (my $checkps_fh, '-|', "$PS -auwx") || die "Cannot check for kernel reordering. $!\n";
+	open (my $checkps_fh, '-|', $PS, '-auwx') || die "Cannot check for kernel reordering. $!\n";
 	$waiting_on_kernel = 0;
 	while (<$checkps_fh>) {
 	    if (/$REORDER_KERNEL/) {
@@ -1067,7 +1087,7 @@ if ($^O eq 'openbsd' && !$audit_flag) {
 }
 
 foreach $file (@files) {
-    @file_group_tags = split (/\s+/, $group_tags{$file}) if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag || $sappnd_group_flag);
+    @file_group_tags = split (/\s+/, $group_tags{$file} // '') if ($specified_group_tag || $uchg_group_flag || $schg_group_flag || $uappnd_group_flag || $sappnd_group_flag);
 
     # uchg group is in config
     if ($uchg_group_flag) {
@@ -1207,8 +1227,9 @@ foreach $file (@files) {
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			next unless $entry =~ /^([-\w.+]+)$/;
-			my $clean_entry = "$file/$1";
+			my $safe = _untaint_entry ($file, $entry);
+			next unless defined ($safe);
+			my $clean_entry = "$file/$safe";
 			next if -d $clean_entry;  # skip subdirectories
 			system (@lock_command, $lock_flag, $clean_entry);
 		    }
@@ -1221,8 +1242,9 @@ foreach $file (@files) {
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			next unless $entry =~ /^([-\w.+]+)$/;
-			my $clean_entry = "$file/$1";
+			my $safe = _untaint_entry ($file, $entry);
+			next unless defined $safe;
+			my $clean_entry = "$file/$safe";
 			next unless -e $clean_entry;
 			system (@lock_command, $lock_flag, $clean_entry);
 		    }
@@ -1236,8 +1258,9 @@ foreach $file (@files) {
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			next unless $entry =~ /^([-\w.+]+)$/;
-			_recurse_lock_or_unlock ("$file/$1", $lock_flag);
+			my $safe = _untaint_entry ($file, $entry);
+			next unless defined $safe;
+			_recurse_lock_or_unlock ("$file/$safe", $lock_flag);
 		    }
 		}
 		else {
@@ -1285,32 +1308,39 @@ foreach $file (@files) {
 		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
 		    closedir ($dh);
 		    foreach my $entry (@entries) {
-			next unless $entry =~ /^([-\w.+]+)$/;
-			my $clean_entry = "$file/$1";
+			my $safe = _untaint_entry ($file, $entry);
+			next unless defined $safe;
+			my $clean_entry = "$file/$safe";
 			next if -d $clean_entry;  # skip subdirectories
 			system (@lock_command, $unlock_flag, $clean_entry);
 		    }
 		    system (@lock_command, $unlock_flag, $file);
 		}
 		elsif ($dont_recurse{$file}) {
-		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		    print "unlocking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    foreach my $entry (glob("$file/*")) {
-			next unless $entry =~ m{^([-\w./+]+)$};
-			my $clean_entry = $1;
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
+			my $safe = _untaint_entry ($file, $entry);
+			next unless defined $safe;
+			my $clean_entry = "$file/$safe";
 			next unless -e $clean_entry;
 			system (@lock_command, $unlock_flag, $clean_entry);
 		    }
+		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
+		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
 		}
 		elsif ($dont_lock_top_level_dir{$file}) {
 		    print "recursively unlocking $file/*\n" if ($verbose_flag);
 		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    foreach my $entry (glob("$file/*")) {
-			next unless $entry =~ m{^([-\w./+]+)$};
-			_recurse_lock_or_unlock ($1, $unlock_flag);
+		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
+		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+		    closedir ($dh);
+		    foreach my $entry (@entries) {
+			next unless $entry =~ /^([-\w.+]+)$/;
+			_recurse_lock_or_unlock ("$file/$1", $unlock_flag);
 		    }
 		}
 		else {
@@ -1368,6 +1398,18 @@ sub _effective_flag_type {
     return $BSD_SYS_APPEND_FLAG_ON     if grep { $_ eq $BSD_SYS_APPEND_FLAG_ON }     @tag_list;
     return $BSD_USER_APPEND_FLAG_ON    if grep { $_ eq $BSD_USER_APPEND_FLAG_ON }    @tag_list;
     return $global_lock_flag;
+}
+
+### Subroutines.
+
+# Untaint a directory entry. Returns the untainted name, or warns and
+# returns undef if it contains characters outside our safe set, so an
+# admin knows a listed file was not actually processed.
+sub _untaint_entry {
+    my ($dir, $entry, $no_warn) = @_;
+    return $1 if $entry =~ /^([-\w.+\s,()~!@#%^&=]+)$/;
+    warn "Warning: skipping \"$dir/$entry\": filename contains characters outside the safe set; not processed.\n" unless $no_warn;
+    return undef;
 }
 
 # Subroutine to detect ancestor/descendant conflicts: cases where the same
@@ -1479,7 +1521,7 @@ sub _in_group {
 # Subroutine to warn about unusual characters or nonexistent file paths in config
 # and to untaint the result.
 sub _file_warnings {
-    my ($path, $options) = @_;  # $options is optional; passed when a prefix char was used
+    my ($path, $prefix_options) = @_;  # $prefix_options is optional; passed when a prefix char was used
     
     if ($path =~ /[;&|`\$\(\)<>]/) {
         die "Shell metacharacters in config file path not allowed. $path\n";
@@ -1515,8 +1557,8 @@ sub _file_warnings {
 	print "Warning: File path in config is a symlink. $clean_path\n";
     }
     # Warn if a directory-only prefix (+, -, =) is used on a non-directory path.
-    if (defined $options && $options =~ /[-+=]/ && -e $clean_path && !-d $clean_path) {
-	print "Warning: prefix '$options' has no effect on non-directory path $clean_path\n";
+    if (defined $prefix_options && $prefix_options =~ /[-+=]/ && -e $clean_path && !-d $clean_path) {
+	print "Warning: prefix '$prefix_options' has no effect on non-directory path $clean_path\n";
     }
     # For non-root BSD users, warn if the file is not owned by the invoking user.
     if ($nonroot_flag && -e $clean_path) {
@@ -1628,20 +1670,20 @@ sub _expand_glob {
 }
 
 # Subroutine to determine if / is mounted read-only.
+# Syslock never manages files on the sealed volume on macOS, only the
+# writeable data volume.
 sub _root_ro {
-    my ($mount_output, $mount_opts_list, @mount_opts);
-    my $mount_cmd = $bsd ? $BSD_MOUNT_COMMAND : $LINUX_MOUNT_COMMAND;
+    return 0 if $^O eq 'darwin';   # / is sealed/RO by design; remount would fail and isn't needed.
 
+    my $mount_cmd = $bsd ? $BSD_MOUNT_COMMAND : $LINUX_MOUNT_COMMAND;
     open (my $mount_fh, '-|', $mount_cmd) or die "Cannot run mount. $!\n";
-    $mount_output = do { local $/; <$mount_fh> }; # slurp entire output
+    my $mount_output = do { local $/; <$mount_fh> };
     close ($mount_fh);
 
-    if ($mount_output =~ /\/.* on \/ type.*\((.*)\)/) {
-	$mount_opts_list = $1;
-	@mount_opts = split (/,/, $mount_opts_list);
-	return 1 if (grep { $_ eq 'ro' } @mount_opts);
+    if ($mount_output =~ m{ on / (?:type \S+ )?\(([^)]*)\)}) {
+        my @opts = map { my $o = $_; $o =~ s/^\s+|\s+$//g; $o } split (/,/, $1);
+        return 1 if grep { $_ eq 'ro' || $_ eq 'read-only' } @opts;
     }
-
     return 0;
 }
 
@@ -1756,10 +1798,9 @@ sub _recurse_lock_or_unlock {
 	my @entries = grep(!/^\.$|^\.\.$/, readdir($dh));
 	closedir ($dh);
 	for (@entries) {
-	    # Untaint readdir() results before constructing paths for system().
-	    next unless /^([-\w.+]+)$/;
-	    my $entry = $1;
-	    _recurse_lock_or_unlock ("$path/$entry", $flag);
+	    my $safe = _untaint_entry ($path, $_);
+	    next unless defined $safe;
+	    _recurse_lock_or_unlock ("$path/$safe", $flag);
 	}
 	system (@lock_command, $flag, $path);
     }
@@ -1830,9 +1871,16 @@ sub _audit_file {
 	@subfiles = grep (!/^\.{1,2}$/, readdir ($dir_fh));
 	closedir ($dir_fh);
 
+	# The untainting process skips files that don't match the regexp
+	# and generates warnings. If we hit such a file in an audit when
+	# -q (quiet) is used, we assume failure.
 	foreach $subfile (@subfiles) {
 	    # Untaint readdir() result.
-	    next unless $subfile =~ /^([-\w.+]+)$/;
+	    my $safe = _untaint_entry ($file, $subfile, $quiet_flag);
+	    unless (defined $safe) {
+		$found_mismatch = 1;
+		next;
+	    }
 	    $subfile = $1;
 	    if (-l "$file/$subfile" || -c "$file/$subfile") {
 		# Ignore links and special character files.

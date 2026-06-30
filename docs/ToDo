@@ -1,3 +1,17 @@
+(Fixed 1.19) Claude Opus 4.8 assessment, fixed bugs: Fix asymmetry in
+    handling hidden files (previously locked but not unlocked, now
+    handled), add / target for Linux mount, don't mess with mount on
+    macOS, use untaint subroutine and broaden acceptable chars and
+    emit warnings when unacceptable filenames are hit, fix bug with
+    $bsd flag used before it was set, avoid unitialized value warnings
+    for files with no group tags defined, fail closed on securelevel
+    parsing, remove last remaining shell invocation in wait loop, die
+    instead of warning if config is group writable, don't use $options
+    variable for two different purposes, give nonzero exit when bad
+    options are supplied, return failure exit ($file_mismatch) with -a
+    -q if we hit a file that can't be untainted due to unacceptable
+    chars in filename (_untaint_entry).
+
 (Done 1.18a) Make -a -q much faster (potentially) by exiting at
 first mismatch.
 
