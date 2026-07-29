@@ -212,6 +212,8 @@
 #    return failure exit ($file_mismatch) with -a -q if we hit a file
 #    that can't be untainted due to unacceptable chars in filename
 #    (_untaint_entry).
+# Modified 28 July 2026 by Jim Lippard to fix bug in audit's untaint
+#    handling where $1 was being used instead of $safe.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -243,7 +245,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.19 of 30 June 2026';
+my $VERSION = '1.19a of 28 July 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -1885,7 +1887,7 @@ sub _audit_file {
 		$found_mismatch = 1;
 		next;
 	    }
-	    $subfile = $1;
+	    $subfile = $safe;
 	    if (-l "$file/$subfile" || -c "$file/$subfile") {
 		# Ignore links and special character files.
 		next;
@@ -1905,7 +1907,8 @@ sub _audit_file {
 		$recurse_level--;
 		return $found_mismatch if ($quiet_flag && $found_mismatch);
 	    }
-	    elsif ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag)) {
+	    elsif (-e "$file/$subfile" &&
+		   ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag))) {
 		if (!$printed_something && !$quiet_flag) {
 		    print ' 'x$spaces, "In $file/:\n";
 		    $printed_something = 1;
