@@ -214,6 +214,39 @@
 #    (_untaint_entry).
 # Modified 28 July 2026 by Jim Lippard to fix bug in audit's untaint
 #    handling where $1 was being used instead of $safe.
+# Modified 12 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.20):
+#    Fix sappnd "restore" branch in the per-file flag selection, which
+#    reset $lock_flag to the global default even when the current file
+#    had just been set to uchg/schg/uappnd, so the first file after a
+#    sappnd file got the wrong flag (e.g. a live uappnd log got schg).
+#    Fix uappnd-only groups being unusable at securelevel > 0 when schg
+#    is the default ("No group:uchg to unlock"), and plain syslock/
+#    sysunlock at securelevel > 0 skipping uappnd files; uappnd files
+#    are now processed alongside uchg files, as documented. Files listed
+#    before the first group: line now get the implicit flag tag on BSD,
+#    as grouped files do, so they are skipped like other schg files.
+#    Check the exit status of every chflags/chattr/mount command; any
+#    failure is reported and syslock/sysunlock exit 1 (previously 0).
+#    An unreadable directory is reported and counted as a failure
+#    instead of aborting the run part way through.
+#    Remount / read-only on die or SIGINT/TERM/HUP if we remounted it.
+#    Skip symlinks and character devices inside directories with the
+#    + and = prefixes (chflags follows symlinks, so a link inside such a
+#    directory previously locked its target, wherever it was).
+#    Lock and unlock now share one directory-handling routine; the
+#    unlock side of the - prefix used a narrower filename regex than the
+#    lock side and silently left some files locked.
+#    Fix group: line parsing leaving the uappnd/sappnd in-use flags set
+#    from the previous line (a sappnd line after a uappnd line was
+#    rejected as a combination), and reject group names containing
+#    characters outside the allowed set instead of silently truncating
+#    them (a trailing # comment is allowed).
+#    Accept securelevel -1. Accept "immutable-flag: +i" on Linux, as
+#    documented. -q now also silences config-parse warnings. Perl itself
+#    never writes, so drop the wpath and fattr pledges and unveil listed
+#    paths r instead of rw. Treat a file whose flags cannot be read as a
+#    mismatch in audit rather than as matching.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -245,7 +278,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.19a of 28 July 2026';
+my $VERSION = '1.20 of 12 October 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -317,6 +350,10 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $waiting_on_libs, $start_time, $reason,
     $force_flag, $audit_flag, $quiet_flag, $operational_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
+
+# Set when any chflags/chattr/mount command fails or a directory cannot
+# be read; makes the script exit 1.
+my $any_failure = 0;
 
 ### Main program.
 
@@ -460,8 +497,10 @@ if ($^O eq 'openbsd') {
 	unveil ();
     }
     
-    # stdio included automatically.
-    my @promises = ('rpath', 'wpath', 'fattr', 'exec', 'proc');
+    # stdio included automatically. Perl itself only reads; flags are
+    # changed by chflags and / is remounted by mount, both run via exec
+    # (no execpromises, so they are not restricted by this pledge).
+    my @promises = ('rpath', 'exec', 'proc');
     push (@promises, 'unveil') unless $audit_flag;
     pledge (@promises) || die "Cannot pledge promises. $!\n";
 }
@@ -473,6 +512,15 @@ $bsd = $linux = 0;
 $current_group_tags = 0;
 
 $root_was_ro = 0;
+
+# If we remounted / writable and then die or are interrupted part way
+# through, put it back. local $? keeps our exit status; the default
+# signal action would skip END entirely.
+END {
+    local $?;
+    _restore_root_ro () if ($root_was_ro);
+}
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { die "Caught SIG$_[0], aborting.\n"; };
 
 # BSD or Linux?
 if (-e $BSD_LOCK_COMMAND) {
@@ -554,7 +602,7 @@ while (<$config_fh>) {
     chomp;
     if (/^\s*$|^\s*#/) { # Comment or blank space.
     }
-    elsif (/^immutable-flag:\s+(\w+)$/) {
+    elsif (/^immutable-flag:\s+(\S+)\s*$/) { # \S, not \w: must match +i
 	if (($1 eq $BSD_SYS_IMMUTABLE_FLAG_ON) ||
 		     ($1 eq $BSD_USER_IMMUTABLE_FLAG_ON)) {
 	    if ($linux) {
@@ -581,16 +629,20 @@ while (<$config_fh>) {
 	    die "Config file specifies unknown lock flag type \"$1\".\n";
 	}
     }
-    elsif (/^group:\s+([\w\s\-\+]+)/) {
+    elsif (/^group:\s+([\w\s\-\+]+?)\s*(?:#.*)?$/) {
 	$current_group_tags = $1;
 	print "DEBUG: current_group_tags = $current_group_tags\n" if ($debug_flag);
 	@new_group_tags = split (/\s+/, $current_group_tags);
+	# The in-use flags describe this group: line only. Reset all four
+	# before looking at its tags, so nothing carries over from the
+	# previous line.
+	$uchg_group_in_use_flag = 0;
+	$schg_group_in_use_flag = 0;
+	$uappnd_group_in_use_flag = 0;
+	$sappnd_group_in_use_flag = 0;
 	if ($bsd && grep { $_ eq $BSD_USER_IMMUTABLE_FLAG_ON } @new_group_tags) {
 	    $uchg_group_flag = 1;
 	    $uchg_group_in_use_flag = 1;
-	}
-	else {
-	    $uchg_group_in_use_flag = 0;
 	}
 	if ($bsd && grep { $_ eq $BSD_SYS_IMMUTABLE_FLAG_ON } @new_group_tags) {
 	    die "Cannot use both $BSD_USER_IMMUTABLE_FLAG_ON and $BSD_SYS_IMMUTABLE_FLAG_ON groups in combination. $_\n" if ($uchg_group_in_use_flag);
@@ -598,9 +650,6 @@ while (<$config_fh>) {
 
 	    $schg_group_flag = 1;
 	    $schg_group_in_use_flag = 1;
-	}
-	else {
-	    $schg_group_in_use_flag = 0;
 	}
 	# Detect BSD uappnd group tag.
 	if ($bsd && grep { $_ eq $BSD_USER_APPEND_FLAG_ON } @new_group_tags) {
@@ -610,7 +659,7 @@ while (<$config_fh>) {
 	    $uappnd_group_in_use_flag = 1;
 	}
 	# Detect BSD sappnd group tag.
-	elsif ($bsd && grep { $_ eq $BSD_SYS_APPEND_FLAG_ON } @new_group_tags) {
+	if ($bsd && grep { $_ eq $BSD_SYS_APPEND_FLAG_ON } @new_group_tags) {
 	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_IMMUTABLE_FLAG_ON or $BSD_SYS_IMMUTABLE_FLAG_ON in the same group. $_\n"
 		if ($uchg_group_in_use_flag || $schg_group_in_use_flag);
 	    die "Cannot combine $BSD_SYS_APPEND_FLAG_ON with $BSD_USER_APPEND_FLAG_ON in the same group. $_\n"
@@ -620,13 +669,9 @@ while (<$config_fh>) {
 	    $sappnd_group_in_use_flag = 1;
 	}
 	# Detect Linux +a group tag.
-	elsif ($linux && grep { $_ eq '+a' } @new_group_tags) {
+	if ($linux && grep { $_ eq '+a' } @new_group_tags) {
 	    $uappnd_group_flag = 1;
 	    $uappnd_group_in_use_flag = 1;
-	}
-	else {
-	    $uappnd_group_in_use_flag = 0;
-	    $sappnd_group_in_use_flag = 0;
 	}
 	# Prepend implicit tag for immutable flag (only when not a uappnd/+a/sappnd group).
 	if ($bsd && !$schg_group_in_use_flag && !$uchg_group_in_use_flag && !$uappnd_group_in_use_flag && !$sappnd_group_in_use_flag) {
@@ -714,6 +759,18 @@ while (<$config_fh>) {
 }
 close ($config_fh);
 print "DEBUG: closing config file\n" if ($debug_flag);
+
+# Files listed before the first group: line have no group tags. On BSD,
+# give them the implicit flag tag that grouped files get at parse time,
+# so the per-file securelevel handling skips them like any other file
+# using that flag (they would otherwise be processed with schg at
+# securelevel > 0 now that plain syslock/sysunlock is no longer
+# narrowed to the uchg group there).
+if ($bsd) {
+    foreach my $f (@files) {
+	$group_tags{$f} = $lock_flag unless defined ($group_tags{$f});
+    }
+}
 
 # Reset per-group-line in-use flags that were left set by config parsing.
 # They are re-driven file-by-file in the main loop below.
@@ -896,93 +953,67 @@ if ($bsd && ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON ||
     $level = <$sysctl_fh>;
     close ($sysctl_fh);
     chomp ($level);
+    # Securelevel may be -1 (permanently insecure mode), which allows
+    # the same operations as 0.
     if ($^O eq 'darwin') {
-	$level =~ s/kern\.securelevel:\s*(\d+)/$1/;
+	$level =~ s/kern\.securelevel:\s*(-?\d+)/$1/;
     }
     else {
-	$level =~ s/kern\.securelevel\s*=\s*(\d+)/$1/;
+	$level =~ s/kern\.securelevel\s*=\s*(-?\d+)/$1/;
     }
-    die "Cannot identify system securelevel. $level\n" if ($level !~ /^\d+/);
+    die "Cannot identify system securelevel. $level\n" if ($level !~ /^-?\d+$/);
+
+    # uchg and uappnd files can be changed at any securelevel, so when
+    # schg is the default they are what syslock/sysunlock can still
+    # process at securelevel > 0 (schg and sappnd files are skipped in
+    # the per-file loop).
+    my $any_lowsec_group_flag = ($uchg_group_flag || $uappnd_group_flag);
+    # With a group specified, check it has something we can process: the
+    # suffix forms (:uchg, :uappnd) were already checked against their
+    # flag above, and :sappnd is handled by the sappnd block below.
+    my $group_has_lowsec_files =
+	(!$specified_group_tag ||
+	 $uchg_group_specified_flag || $uappnd_group_specified_flag ||
+	 $sappnd_group_specified_flag ||
+	 (grep { $_ eq $specified_group_tag } @uchg_group_tags) ||
+	 (grep { $_ eq $specified_group_tag } @uappnd_group_tags));
 
     # Warnings and errors.
     if ($level > 0) {
 	# For $BSD_SYS_IMMUTABLE_FLAG_ON:
 	# If lock, -f (force) overrides securelevel requirement.
-	#    If uchg groups in use, they will be locked.
+	#    If uchg/uappnd groups in use, they will be locked.
 	# If unlock, securelevel must be < 1.
-	#    If uchg groups in use, they will be unlocked.
+	#    If uchg/uappnd groups in use, they will be unlocked.
 	# Don't die if -a (audit), but warn.
 	# Also die if schg group was explicitly specified.
 	if ($lock_flag eq $BSD_SYS_IMMUTABLE_FLAG_ON) {
-	    print "DEBUG: uchg_group_flag=$uchg_group_flag\n" if ($debug_flag);
-	    if ($mode == $LOCK) {
-		if ((!$force_flag && !$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$force_flag && !$audit_flag)) {
-		    die "System securelevel is $level; syslock requires -f option or securelevel < 1.\n";
-		}
-		elsif ($audit_flag) {
-		    print "System securelevel is $level; syslock requires -f option or securelevel < 1.\n" unless $quiet_flag;
-		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
-		    # With -o, schg files should be skipped in the per-file loop
-		    # just as they would be in a normal syslock run without -f.
-		    # Set $schg_group_flag so the per-file next guard fires.
-		    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag && !$force_flag) {
-			$schg_group_flag = 1;
-		    }
-		}
-		# Implicit uchg group specified.
-		elsif ($uchg_group_flag && !$force_flag) {
-		    $schg_group_flag = 1; # necessary to skip schg files
-		    
-		    if (!$specified_group_tag) {
-			$specified_group_tag = $BSD_USER_IMMUTABLE_FLAG_ON;
-		    }
-		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
-			# Can't implicitly add :uchg if there's no such group.
-			if (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
-			    die "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" unless $audit_flag;
-			    print "System securelevel is $level; syslock requires -f option or securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to lock.\n" if ($audit_flag && !$quiet_flag);
-			}
-#			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON
-		    }
-
-		    # Here to avoid duplicate in case where above die error occurs.
-		    print "System securelevel is $level; syslock requires -f option or securelevel < 1. Locking uchg group only\n" if ($verbose_flag);
+	    print "DEBUG: uchg_group_flag=$uchg_group_flag uappnd_group_flag=$uappnd_group_flag\n" if ($debug_flag);
+	    my ($cmd, $req, $verb) = ($mode == $LOCK)
+		? ('syslock', '-f option or securelevel < 1', 'lock')
+		: ('sysunlock', 'securelevel < 1', 'unlock');
+	    my $no_force = ($mode == $UNLOCK || !$force_flag);
+	    if ($no_force && !$audit_flag &&
+		(!$any_lowsec_group_flag || $schg_group_specified_flag)) {
+		die "System securelevel is $level; $cmd requires $req.\n";
+	    }
+	    elsif ($audit_flag) {
+		print "System securelevel is $level; $cmd requires $req.\n" unless $quiet_flag;
+		print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
+		# With -o, schg files should be skipped in the per-file loop
+		# just as they would be in a normal run without -f.
+		# Set $schg_group_flag so the per-file next guard fires.
+		if ($operational_flag && !$schg_group_specified_flag && $any_lowsec_group_flag) {
+		    $schg_group_flag = 1;
 		}
 	    }
-	    else { # mode == UNLOCK
-		if ((!$audit_flag && !$uchg_group_flag) || ($schg_group_specified_flag && !$audit_flag)) {
-		    die "System securelevel is $level; sysunlock requires securelevel < 1.\n";
+	    # Only uchg/uappnd files will be processed.
+	    elsif ($no_force) {
+		$schg_group_flag = 1; # necessary to skip schg files in the per-file loop
+		if (!$group_has_lowsec_files) {
+		    die "System securelevel is $level; $cmd requires $req. No $BSD_USER_IMMUTABLE_FLAG_ON or $BSD_USER_APPEND_FLAG_ON files in $specified_group_tag to $verb.\n";
 		}
-		elsif ($audit_flag) {
-		    print "System securelevel is $level; sysunlock requires securelevel < 1.\n" unless $quiet_flag;
-		    print "Overriding -o to audit schg files as explicitly requested.\n" if ($operational_flag && $schg_group_specified_flag && !$quiet_flag);
-		    # With -o, schg files should be skipped in the per-file loop
-		    # just as they would be in a normal sysunlock run.
-		    # Set $schg_group_flag so the per-file next guard fires.
-		    if ($operational_flag && !$schg_group_specified_flag && $uchg_group_flag) {
-			$schg_group_flag = 1;
-		    }
-		}
-		# Implicit uchg group specified.
-		elsif ($uchg_group_flag) {
-		    $schg_group_flag = 1; # necessary to skip schg files
-		    
-		    if (!$specified_group_tag) {
-			$specified_group_tag = $BSD_USER_IMMUTABLE_FLAG_ON;
-		    }
-		    elsif ($specified_group_tag !~ /$BSD_USER_IMMUTABLE_FLAG_ON/) {
-			# Can't implicitly add :uchg if there's no such group.
-			if (!grep { $_ eq $specified_group_tag } @uchg_group_tags) {
-			    die "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" unless $audit_flag;
-			    print "System securelevel is $level; sysunlock requires securelevel < 1. No $specified_group_tag:$BSD_USER_IMMUTABLE_FLAG_ON to unlock.\n" if ($audit_flag && !$quiet_flag);
-			}
-
-#			$specified_group_tag .= ':' . $BSD_USER_IMMUTABLE_FLAG_ON;
-		    }
-
-		    # Here to avoid duplicate in case where above die error occurs.
-		    print "System securelevel is $level; sysunlock requires securelevel < 1. Unlocking uchg group only.\n" if ($verbose_flag);
-		}
+		print "System securelevel is $level; $cmd requires $req. ${\ucfirst($verb)}ing $BSD_USER_IMMUTABLE_FLAG_ON and $BSD_USER_APPEND_FLAG_ON files only.\n" if ($verbose_flag);
 	    }
 	}
 	# For $BSD_USER_IMMUTABLE_FLAG_ON:
@@ -1064,15 +1095,15 @@ if ($wait_flag) {
 }
 
 # If / happens to be mounted as readonly, make it writeable.
+# Nothing has been changed yet, so if this fails, stop.
 if (!$audit_flag && _root_ro()) {
-    $root_was_ro = 1;
     print "mounting / as writable\n" if ($verbose_flag);
-    if ($bsd) {
-	system ($BSD_MOUNT_COMMAND, @BSD_MOUNT_ARGS) unless ($debug_flag);
+    unless ($debug_flag) {
+	my @mount = $bsd ? ($BSD_MOUNT_COMMAND, @BSD_MOUNT_ARGS)
+	                 : ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_ARGS);
+	_run (@mount) or die "Could not mount / writable; no changes made.\n";
     }
-    else {
-	system ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_ARGS) unless ($debug_flag);
-    }
+    $root_was_ro = 1;
 }
 
 # Accumulates whether any audit mismatch was found; used by -q exit code.
@@ -1082,7 +1113,7 @@ my $any_mismatch = 0;
 # if an individual group has been specified.
 if ($^O eq 'openbsd' && !$audit_flag) {
     foreach $file (@files) {
-	unveil ($file, 'rw');
+	unveil ($file, 'r'); # perl only reads; chflags runs via exec
     }
     # Lock any further unveiling.
     unveil ();
@@ -1189,189 +1220,58 @@ foreach $file (@files) {
 	    $lock_flag   = $BSD_SYS_APPEND_FLAG_ON;
 	    $unlock_flag = "no$BSD_SYS_APPEND_FLAG_ON";
 	}
-	# Restore if it's not a sappnd file.
+	# Leaving a sappnd file. As with uappnd above, the uchg, schg and
+	# uappnd blocks have already set $lock_flag for this file if it is
+	# in one of those groups; only fall back to the global default if
+	# none of them did. (Without this check, the first file after a
+	# sappnd file got the global flag -- e.g. a live uappnd log got
+	# schg.)
 	elsif ($sappnd_group_in_use_flag) {
 	    $sappnd_group_in_use_flag = 0;
-	    $lock_flag   = $global_lock_flag;
-	    $unlock_flag = $global_unlock_flag;
+	    if (!$uchg_group_in_use_flag && !$schg_group_in_use_flag &&
+		!$uappnd_group_in_use_flag) {
+		$lock_flag   = $global_lock_flag;
+		$unlock_flag = $global_unlock_flag;
+	    }
 	}
     }
 
     if ((!$singleuser_flag || $singleuser_unlocked{$file}) &&
 	(!$specified_group_tag || _in_group ($specified_group_tag, $uchg_group_specified_flag, $schg_group_specified_flag, $sappnd_group_specified_flag, @file_group_tags))) {
-	if ($mode == $LOCK) {
-	    if ($specified_group_tag &&
-		$verbose_flag &&
-		!$displayed_verbose_group_msg_flag) {
-		print "locking group $specified_group_tag";
-		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
-		print ":$BSD_SYS_IMMUTABLE_FLAG_ON" if ($schg_group_specified_flag && $specified_group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);
-		if ($uappnd_group_specified_flag) {
-		    my $atag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
-		    print ":$atag" if ($specified_group_tag ne $atag);
-		}
-		print ":$BSD_SYS_APPEND_FLAG_ON" if ($sappnd_group_specified_flag && $specified_group_tag ne $BSD_SYS_APPEND_FLAG_ON);
-		print "\n";
-		$displayed_verbose_group_msg_flag = 1;
+	# Lock and unlock share everything below except the flag and the
+	# words in messages, so that the two cannot drift apart.
+	my $verb = ($mode == $LOCK) ? 'locking' : 'unlocking';
+	my $flag = ($mode == $LOCK) ? $lock_flag : $unlock_flag;
+	if ($specified_group_tag &&
+	    $verbose_flag &&
+	    !$displayed_verbose_group_msg_flag) {
+	    print "$verb group $specified_group_tag";
+	    print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
+	    print ":$BSD_SYS_IMMUTABLE_FLAG_ON" if ($schg_group_specified_flag && $specified_group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);
+	    if ($uappnd_group_specified_flag) {
+		my $atag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
+		print ":$atag" if ($specified_group_tag ne $atag);
 	    }
-	    if ($audit_flag) {
-		# Report on what is unlocked that would be locked by command.
-		$any_mismatch |= _audit_file ($file, $lock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
-		exit 1 if ($quiet_flag && $any_mismatch);
-	    }
-	    elsif (-d $file) {
-		if ($files_only{$file}) {
-		    # Lock the directory itself and direct file contents only,
-		    # skipping subdirectories entirely.
-		    print "locking $file (files only)\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			my $safe = _untaint_entry ($file, $entry);
-			next unless defined ($safe);
-			my $clean_entry = "$file/$safe";
-			next if -d $clean_entry;  # skip subdirectories
-			system (@lock_command, $lock_flag, $clean_entry);
-		    }
-		    system (@lock_command, $lock_flag, $file);
-		}
-		elsif ($dont_recurse{$file}) {
-		    print "locking $file/*\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			my $safe = _untaint_entry ($file, $entry);
-			next unless defined $safe;
-			my $clean_entry = "$file/$safe";
-			next unless -e $clean_entry;
-			system (@lock_command, $lock_flag, $clean_entry);
-		    }
-		    print "locking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
-		    system (@lock_command, $lock_flag, $file) unless $dont_lock_top_level_dir{$file};
-		}
-		elsif ($dont_lock_top_level_dir{$file}) {
-		    print "recursively locking $file/*\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			my $safe = _untaint_entry ($file, $entry);
-			next unless defined $safe;
-			_recurse_lock_or_unlock ("$file/$safe", $lock_flag);
-		    }
-		}
-		else {
-		    print "recursively locking $file\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    system (@lock_command, $RECURSE_FLAG, $lock_flag, $file);
-		}
-	    }
-	    elsif (-e $file) {
-		print "locking $file\n" if ($verbose_flag);
-		print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		system (@lock_command, $lock_flag, $file);
-	    }
-	    else {
-		print "Not locking. File path in config inaccessible or does not exist. $!. $file\n";
-	    }
+	    print ":$BSD_SYS_APPEND_FLAG_ON" if ($sappnd_group_specified_flag && $specified_group_tag ne $BSD_SYS_APPEND_FLAG_ON);
+	    print "\n";
+	    $displayed_verbose_group_msg_flag = 1;
+	}
+	if ($audit_flag) {
+	    # syslock: report what is unlocked that would be locked.
+	    # sysunlock: report what is locked that would be unlocked.
+	    $any_mismatch |= _audit_file ($file, $flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
+	    exit 1 if ($quiet_flag && $any_mismatch);
 	}
 	else {
-	    if ($specified_group_tag &&
-		$verbose_flag &&
-		!$displayed_verbose_group_msg_flag) {
-		print "unlocking group $specified_group_tag";
-		print ":$BSD_USER_IMMUTABLE_FLAG_ON" if ($uchg_group_specified_flag && $specified_group_tag ne $BSD_USER_IMMUTABLE_FLAG_ON);
-		print ":$BSD_SYS_IMMUTABLE_FLAG_ON" if ($schg_group_specified_flag && $specified_group_tag ne $BSD_SYS_IMMUTABLE_FLAG_ON);
-		if ($uappnd_group_specified_flag) {
-		    my $atag = $bsd ? $BSD_USER_APPEND_FLAG_ON : '+a';
-		    print ":$atag" if ($specified_group_tag ne $atag);
-		}
-		print ":$BSD_SYS_APPEND_FLAG_ON" if ($sappnd_group_specified_flag && $specified_group_tag ne $BSD_SYS_APPEND_FLAG_ON);
-		print "\n";
-		$displayed_verbose_group_msg_flag = 1;
-	    }
-	    if ($audit_flag) {
-		# Report on what is locked that would be unlocked by command.
-		$any_mismatch |= _audit_file ($file, $unlock_flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
-		exit 1 if ($quiet_flag && $any_mismatch);
-	    }
-	    elsif (-d $file) {
-		if ($files_only{$file}) {
-		    # Unlock the directory itself and direct file contents only,
-		    # skipping subdirectories entirely.
-		    print "unlocking $file (files only)\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			my $safe = _untaint_entry ($file, $entry);
-			next unless defined $safe;
-			my $clean_entry = "$file/$safe";
-			next if -d $clean_entry;  # skip subdirectories
-			system (@lock_command, $unlock_flag, $clean_entry);
-		    }
-		    system (@lock_command, $unlock_flag, $file);
-		}
-		elsif ($dont_recurse{$file}) {
-		    print "unlocking $file/*\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			my $safe = _untaint_entry ($file, $entry);
-			next unless defined $safe;
-			my $clean_entry = "$file/$safe";
-			next unless -e $clean_entry;
-			system (@lock_command, $unlock_flag, $clean_entry);
-		    }
-		    print "unlocking $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
-		    system (@lock_command, $unlock_flag, $file) unless $dont_lock_top_level_dir{$file};
-		}
-		elsif ($dont_lock_top_level_dir{$file}) {
-		    print "recursively unlocking $file/*\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    opendir (my $dh, $file) or die "Cannot open directory $file. $!\n";
-		    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
-		    closedir ($dh);
-		    foreach my $entry (@entries) {
-			next unless $entry =~ /^([-\w.+]+)$/;
-			_recurse_lock_or_unlock ("$file/$1", $unlock_flag);
-		    }
-		}
-		else {
-		    print "recursively unlocking $file\n" if ($verbose_flag);
-		    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		    system (@lock_command, $RECURSE_FLAG, $unlock_flag, $file);
-		}
-	    }
-	    elsif (-e $file) {
-		print "unlocking $file\n" if ($verbose_flag);
-		print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-		system (@lock_command, $unlock_flag, $file);
-	    }
-	    else {
-		print "Not unlocking. File path in config inaccessible or does not exist. $!. $file\n";
-	    }
+	    _lock_or_unlock_path ($file, $flag, $verb);
 	}
     }
 }
 
 # If / was mounted as readonly, make it readonly again.
 if ($root_was_ro) {
-    print "mounting / as readonly\n" if ($verbose_flag);
-    if ($bsd) {
-	system ($BSD_MOUNT_COMMAND, @BSD_MOUNT_RO_ARGS) unless ($debug_flag);
-    }
-    else {
-	system ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_RO_ARGS) unless ($debug_flag);
-    }
+    _restore_root_ro ();
+    $root_was_ro = 0; # so END doesn't do it again
 }
 
 # -q (quiet) audit: exit 0 if filesystem matches expected state, 1 if not.
@@ -1389,6 +1289,10 @@ if ($audit_flag && !$any_mismatch) {
     }
 }
 
+# Lock/unlock: exit 1 if any chflags/chattr/mount command failed or a
+# directory could not be read (each was reported as it happened).
+exit ($any_failure ? 1 : 0);
+
 # Subroutine to return the effective BSD flag type for a path based on
 # its group tags, falling back to the global lock flag.
 sub _effective_flag_type {
@@ -1403,6 +1307,117 @@ sub _effective_flag_type {
 }
 
 ### Subroutines.
+
+# Print a config-parse warning, unless -q (quiet) was given.
+sub _note {
+    print @_ unless $quiet_flag;
+}
+
+# Run a command without a shell. Returns 1 on success. On failure,
+# reports it and sets $any_failure so the script exits 1. (chflags and
+# chattr print their own reason; this adds which command failed.)
+sub _run {
+    my @cmd = @_;
+    system (@cmd);
+    if ($? == -1) {
+	warn "Could not run $cmd[0]: $!\n";
+    }
+    elsif ($? & 127) {
+	warn "$cmd[0] killed by signal " . ($? & 127) . ": @cmd\n";
+    }
+    elsif ($? >> 8) {
+	warn "Failed (exit " . ($? >> 8) . "): @cmd\n";
+    }
+    else {
+	return 1;
+    }
+    $any_failure = 1;
+    return 0;
+}
+
+# Remount / read-only (called at the end of a normal run and from END).
+sub _restore_root_ro {
+    print "mounting / as readonly\n" if ($verbose_flag);
+    return if ($debug_flag);
+    my @mount = $bsd ? ($BSD_MOUNT_COMMAND, @BSD_MOUNT_RO_ARGS)
+	             : ($LINUX_MOUNT_COMMAND, @LINUX_MOUNT_RO_ARGS);
+    _run (@mount) or warn "Warning: / was left mounted read-write.\n";
+}
+
+# Return the untainted entries of a directory, without . and .. .
+# Entries with characters outside the safe set are skipped with a
+# warning (see _untaint_entry). An unreadable directory is reported and
+# counted as a failure rather than aborting the run part way through.
+sub _dir_entries {
+    my ($dir) = @_;
+    my $dh;
+    unless (opendir ($dh, $dir)) {
+	warn "Cannot open directory $dir. $!\n";
+	$any_failure = 1;
+	return ();
+    }
+    my @entries = grep { !/^\.\.?$/ } readdir ($dh);
+    closedir ($dh);
+    return grep { defined } map { _untaint_entry ($dir, $_) } @entries;
+}
+
+# Lock or unlock one config path, honouring its prefix (= + -).
+# $flag is the chflags/chattr flag to apply; $verb is "locking" or
+# "unlocking", for messages. Used for both modes so they stay symmetric.
+# Inside a directory, symlinks and character devices are skipped (as
+# _audit_file and _recurse_lock_or_unlock do): chflags follows a symlink
+# named on its command line, so passing one would change its target.
+sub _lock_or_unlock_path {
+    my ($file, $flag, $verb) = @_;
+
+    if (-d $file) {
+	if ($files_only{$file}) {
+	    # The directory itself and its direct file contents only,
+	    # skipping subdirectories entirely.
+	    print "$verb $file (files only)\n" if ($verbose_flag);
+	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    foreach my $entry (_dir_entries ($file)) {
+		my $path = "$file/$entry";
+		next if (-l $path || -c $path || -d $path);
+		_run (@lock_command, $flag, $path);
+	    }
+	    _run (@lock_command, $flag, $file);
+	}
+	elsif ($dont_recurse{$file}) {
+	    print "$verb $file/*\n" if ($verbose_flag);
+	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    foreach my $entry (_dir_entries ($file)) {
+		my $path = "$file/$entry";
+		next if (-l $path || -c $path);
+		next unless -e $path;
+		_run (@lock_command, $flag, $path);
+	    }
+	    print "$verb $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
+	    _run (@lock_command, $flag, $file) unless $dont_lock_top_level_dir{$file};
+	}
+	elsif ($dont_lock_top_level_dir{$file}) {
+	    print "recursively $verb $file/*\n" if ($verbose_flag);
+	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    foreach my $entry (_dir_entries ($file)) {
+		_recurse_lock_or_unlock ("$file/$entry", $flag);
+	    }
+	}
+	else {
+	    print "recursively $verb $file\n" if ($verbose_flag);
+	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    _run (@lock_command, $RECURSE_FLAG, $flag, $file);
+	}
+    }
+    elsif (-e $file) {
+	print "$verb $file\n" if ($verbose_flag);
+	print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	_run (@lock_command, $flag, $file);
+    }
+    else {
+	my $not = ($mode == $LOCK) ? 'Not locking' : 'Not unlocking';
+	print "$not. File path in config inaccessible or does not exist. $!. $file\n";
+    }
+}
 
 # Untaint a directory entry. Returns the untainted name, or warns and
 # returns undef if it contains characters outside our safe set, so an
@@ -1435,7 +1450,7 @@ sub _check_ancestor_conflicts {
     for my $file (@files) {
         # Skip symlinks -- ancestor detection through symlinks is unreliable.
         if (-l $file) {
-            print "Warning: $file is a symlink; ancestor conflict check skipped.\n";
+            _note ("Warning: $file is a symlink; ancestor conflict check skipped.\n");
             next;
         }
 
@@ -1474,9 +1489,9 @@ sub _check_ancestor_conflicts {
             }
 
             if ($would_process) {
-                print "Warning: $file (flag type: $file_flag) would also be " .
+                _note ("Warning: $file (flag type: $file_flag) would also be " .
                       "processed by ancestor $ancestor (flag type: $ancestor_flag). " .
-                      "Both flags could be set on the same path.\n";
+                      "Both flags could be set on the same path.\n");
             }
         }
     }
@@ -1556,21 +1571,21 @@ sub _file_warnings {
 
     # Ensure existence.
     if (!-e $clean_path) {
-	print "Warning: File path in config inaccessible or does not exist. $!. $clean_path\n";
+	_note ("Warning: File path in config inaccessible or does not exist. $!. $clean_path\n");
     }
     # Warn about symlinks.
     if ($linux && -l $clean_path) {
-	print "Warning: File path in config is a symlink. $clean_path\n";
+	_note ("Warning: File path in config is a symlink. $clean_path\n");
     }
     # Warn if a directory-only prefix (+, -, =) is used on a non-directory path.
     if (defined $prefix_options && $prefix_options =~ /[-+=]/ && -e $clean_path && !-d $clean_path) {
-	print "Warning: prefix '$prefix_options' has no effect on non-directory path $clean_path\n";
+	_note ("Warning: prefix '$prefix_options' has no effect on non-directory path $clean_path\n");
     }
     # For non-root BSD users, warn if the file is not owned by the invoking user.
     if ($nonroot_flag && -e $clean_path) {
         my @fstat = stat ($clean_path);
         if (@fstat && $fstat[4] != $>) {
-            print "Warning: $clean_path is not owned by uid $>; chflags will likely fail.\n";
+            _note ("Warning: $clean_path is not owned by uid $>; chflags will likely fail.\n");
         }
     }
 
@@ -1635,7 +1650,7 @@ sub _expand_glob {
 
     # Verify the directory exists.
     unless (-d $clean_dir) {
-        print "Warning: Directory in glob pattern does not exist. $clean_dir\n";
+        _note ("Warning: Directory in glob pattern does not exist. $clean_dir\n");
         return ();
     }
 
@@ -1651,7 +1666,7 @@ sub _expand_glob {
     my @matches = glob ($full_pattern);
 
     if (!@matches) {
-        print "Warning: Glob pattern in config matches no files. $full_pattern\n";
+        _note ("Warning: Glob pattern in config matches no files. $full_pattern\n");
         return ();
     }
 
@@ -1660,7 +1675,7 @@ sub _expand_glob {
         # Skip directories when glob is used (directories should be listed
         # explicitly to make the recursion/no-recursion intent clear).
         if (-d $match) {
-            print "Warning: Glob pattern matched directory, skipping. $match\n";
+            _note ("Warning: Glob pattern matched directory, skipping. $match\n");
             next;
         }
         my $clean_match = _file_warnings ($match, $prefix_opts);
@@ -1669,7 +1684,7 @@ sub _expand_glob {
     }
 
     if (!@results) {
-        print "Warning: Glob pattern matched no files after filtering. $full_pattern\n";
+        _note ("Warning: Glob pattern matched no files after filtering. $full_pattern\n");
     }
 
     return @results;
@@ -1726,6 +1741,9 @@ sub _desired_flag_mismatch {
 	    or die "Cannot run ls on $file. $!\n";
 	$flags = <$ls_fh>;
 	close ($ls_fh);
+	# If ls printed nothing (e.g. the file vanished), we cannot say the
+	# file is in the desired state; report it rather than pass it.
+	return 'unknown' unless (defined ($flags) && $flags =~ /\S/);
 
         ($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 
@@ -1768,6 +1786,7 @@ sub _desired_flag_mismatch {
 	    or die "Cannot run lsattr on $file. $!\n";
 	$flags = <$lsattr_fh>;
 	close ($lsattr_fh);
+	return 'unknown' unless (defined ($flags) && $flags =~ /\S/);
 	($flags) = split (/\s+/, $flags);
 
 	# For Linux, the locking-relevant flags are i (immutable) and a (append-only).
@@ -1798,20 +1817,15 @@ sub _desired_flag_mismatch {
 # Subroutine to recursively lock or unlock files in subdirectories.
 sub _recurse_lock_or_unlock {
     my ($path, $flag) = @_;
-    return if -l $path; # skip symlinks
+    return if (-l $path || -c $path); # skip symlinks and character devices
     if (-d $path) {
-	opendir (my $dh, $path) or return;
-	my @entries = grep(!/^\.$|^\.\.$/, readdir($dh));
-	closedir ($dh);
-	for (@entries) {
-	    my $safe = _untaint_entry ($path, $_);
-	    next unless defined $safe;
-	    _recurse_lock_or_unlock ("$path/$safe", $flag);
+	foreach my $entry (_dir_entries ($path)) {
+	    _recurse_lock_or_unlock ("$path/$entry", $flag);
 	}
-	system (@lock_command, $flag, $path);
+	_run (@lock_command, $flag, $path);
     }
     elsif (-e $path) {
-	system (@lock_command, $flag, $path);
+	_run (@lock_command, $flag, $path);
     }
 }
 
