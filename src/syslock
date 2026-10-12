@@ -242,7 +242,16 @@
 #    rejected as a combination), and reject group names containing
 #    characters outside the allowed set instead of silently truncating
 #    them (a trailing # comment is allowed).
-#    Accept securelevel -1. Accept "immutable-flag: +i" on Linux, as
+#    On Linux, walk directories in syslock rather than with chattr -R,
+#    passing chattr only regular files and directories: chattr -R exits
+#    1 whenever a tree holds a symlink to a directory, FIFO, socket or
+#    device, which 1.20's exit-status checking turned into a failure on
+#    every run. Paths are passed in batches; a failing batch is retried
+#    path by path so the report names the file. Audit skips the same
+#    entries (lsattr cannot read flags on them either).
+#    On Linux, audit no longer runs stat on a config path that does
+#    not exist (it printed a stat error before reporting the path as
+#    missing). Accept securelevel -1. Accept "immutable-flag: +i" on Linux, as
 #    documented. -q now also silences config-parse warnings. Perl itself
 #    never writes, so drop the wpath and fattr pledges and unveil listed
 #    paths r instead of rw. Treat a file whose flags cannot be read as a
@@ -311,6 +320,7 @@ my $REORDER_KERNEL = '/usr/libexec/reorder_kernel';
 my $RELINK_DIR = '/usr/share/relink';
 my $REBUILD_PREFIX = '_rebuild';
 my $FIVE_MINUTES = 300;
+my $BATCH_SIZE = 200; # paths per chflags/chattr exec when walking a tree
 
 my $LOCK_OPTIONS = 'asdfc:g:vwqoV';
 my $UNLOCK_OPTIONS = 'asdc:g:vqoV';
@@ -1376,36 +1386,48 @@ sub _lock_or_unlock_path {
 	    # skipping subdirectories entirely.
 	    print "$verb $file (files only)\n" if ($verbose_flag);
 	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    my @paths;
 	    foreach my $entry (_dir_entries ($file)) {
 		my $path = "$file/$entry";
-		next if (-l $path || -c $path || -d $path);
-		_run (@lock_command, $flag, $path);
+		next if (-l $path || -c $path || -d $path || !_flaggable ($path));
+		push (@paths, $path);
 	    }
+	    _run_batched ($flag, @paths);
 	    _run (@lock_command, $flag, $file);
 	}
 	elsif ($dont_recurse{$file}) {
 	    print "$verb $file/*\n" if ($verbose_flag);
 	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    my @paths;
 	    foreach my $entry (_dir_entries ($file)) {
 		my $path = "$file/$entry";
-		next if (-l $path || -c $path);
-		next unless -e $path;
-		_run (@lock_command, $flag, $path);
+		next if (-l $path || -c $path || !_flaggable ($path));
+		push (@paths, $path);
 	    }
+	    _run_batched ($flag, @paths);
 	    print "$verb $file\n" if ($verbose_flag && !$dont_lock_top_level_dir{$file});
 	    _run (@lock_command, $flag, $file) unless $dont_lock_top_level_dir{$file};
 	}
 	elsif ($dont_lock_top_level_dir{$file}) {
 	    print "recursively $verb $file/*\n" if ($verbose_flag);
 	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    my @paths;
 	    foreach my $entry (_dir_entries ($file)) {
-		_recurse_lock_or_unlock ("$file/$entry", $flag);
+		_collect_tree ("$file/$entry", \@paths);
 	    }
+	    _run_batched ($flag, @paths);
 	}
 	else {
 	    print "recursively $verb $file\n" if ($verbose_flag);
 	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
-	    _run (@lock_command, $RECURSE_FLAG, $flag, $file);
+	    if ($linux && !-l $file) {
+		# chattr -R exits 1 on any symlink-to-directory, FIFO,
+		# socket or device in the tree; walk it ourselves instead.
+		_recurse_lock_or_unlock ($file, $flag);
+	    }
+	    else {
+		_run (@lock_command, $RECURSE_FLAG, $flag, $file);
+	    }
 	}
     }
     elsif (-e $file) {
@@ -1717,15 +1739,22 @@ sub _on_nonstd_fs {
 
     my $STAT = '/usr/bin/stat';
 
+    # A path that does not exist is not on any filesystem; return 0 so
+    # the caller reports it as missing, instead of running stat on it
+    # (which printed "cannot read file system information" to stderr).
+    return 0 unless (-e $file);
+
     open (my $stat_fh, '-|', $STAT, '-f', '-c', '%T', $file)
 	or die "Cannot run stat on $file. $!\n";
     $fs_type = <$stat_fh>;
     close ($stat_fh);
+    return 0 unless (defined ($fs_type)); # stat failed (and said why)
     chomp ($fs_type);
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
 		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
 #    return 1 if ($fs_type ne 'ext2/ext3');
+    return 0;
 }
 
 # Subroutine to compare actual to desired flags.
@@ -1817,15 +1846,58 @@ sub _desired_flag_mismatch {
 # Subroutine to recursively lock or unlock files in subdirectories.
 sub _recurse_lock_or_unlock {
     my ($path, $flag) = @_;
-    return if (-l $path || -c $path); # skip symlinks and character devices
+    my @paths;
+    _collect_tree ($path, \@paths);
+    _run_batched ($flag, @paths);
+}
+
+# Collect every path under $path (contents before their directory) that
+# can carry a flag. Symlinks and character devices are skipped, as in
+# _audit_file.
+sub _collect_tree {
+    my ($path, $out) = @_;
+    return if (-l $path || -c $path);
     if (-d $path) {
 	foreach my $entry (_dir_entries ($path)) {
-	    _recurse_lock_or_unlock ("$path/$entry", $flag);
+	    _collect_tree ("$path/$entry", $out);
 	}
-	_run (@lock_command, $flag, $path);
+	push (@$out, $path);
     }
-    elsif (-e $path) {
-	_run (@lock_command, $flag, $path);
+    elsif (_flaggable ($path)) {
+	push (@$out, $path);
+    }
+}
+
+# True if chflags/chattr can set a flag on this path. On Linux, chattr
+# only handles regular files and directories: on a symlink, FIFO,
+# socket or device it fails ("Operation not supported while reading
+# flags"), and chattr -R exits 1 if the tree contains any of them, even
+# though everything else was set. BSD chflags handles any inode type
+# (symlinks are excluded by the callers).
+sub _flaggable {
+    my ($path) = @_;
+    return 0 if (-l $path);
+    return 1 if (-f $path || -d $path);
+    return 0 if ($linux);
+    return (-e $path) ? 1 : 0;
+}
+
+# Apply $flag to @paths in batches, so a large tree costs a few hundred
+# execs rather than one per file. If a batch fails, apply the flag to
+# each of its paths separately, so the failure report names the path.
+# (Setting or clearing a flag is idempotent, so the retry is harmless.)
+sub _run_batched {
+    my ($flag, @paths) = @_;
+    while (my @batch = splice (@paths, 0, $BATCH_SIZE)) {
+	if (@batch == 1) {
+	    _run (@lock_command, $flag, $batch[0]);
+	    next;
+	}
+	system (@lock_command, $flag, @batch);
+	next if ($? == 0);
+	foreach my $path (@batch) {
+	    _run (@lock_command, $flag, $path);
+	}
     }
 }
 
@@ -1873,8 +1945,12 @@ sub _audit_file {
 	print "Warning: ignoring symlink. $file\n" if (-l $file && !$quiet_flag);
 	print "Warning: ignoring special character file. $file\n" if (-c $file && !$quiet_flag);
     }
+    elsif ($linux && -e $file && !_flaggable ($file)) {
+	# FIFO, socket or block device: lsattr cannot read flags on it.
+	print "Warning: ignoring special file (not a regular file or directory). $file\n" unless $quiet_flag;
+    }
     elsif ($linux && (_on_nonstd_fs ($file))) {
-	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" if (_on_nonstd_fs ($file) && !$quiet_flag);
+	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" unless $quiet_flag;
     }
     elsif (-d $file) {
 	# We care about the dir itself.
@@ -1902,8 +1978,11 @@ sub _audit_file {
 		next;
 	    }
 	    $subfile = $safe;
-	    if (-l "$file/$subfile" || -c "$file/$subfile") {
-		# Ignore links and special character files.
+	    if (-l "$file/$subfile" || -c "$file/$subfile" ||
+		!_flaggable ("$file/$subfile")) {
+		# Ignore links, special character files, and (on Linux)
+		# anything chattr/lsattr cannot handle -- the same entries
+		# that locking skips.
 		next;
 	    }
 	    if ($linux && _on_nonstd_fs ("$file/$subfile")) {
