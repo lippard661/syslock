@@ -139,7 +139,9 @@ this is how overlapping groups work. Files can appear under multiple
 +   Do not recurse into subdirectories
 -   Lock/unlock directory contents but not the directory itself
 =   Lock/unlock directory and file contents but not subdirectories
+^   Lock/unlock a directory itself, not its contents.
 !   Only operated on by syslock/sysunlock -s (KARL relink files, OpenBSD)
+    (Can be combined with one other flag.)
 ```
 
 See the sample config files in `etc/` for complete annotated examples for
@@ -150,6 +152,9 @@ OpenBSD, Linux, and macOS.
 The sample configs define overlapping groups following this pattern:
 
 - **etc** — frequently modified configs (rc.conf.local, pf.conf, doas.conf, etc.)
+- **etcdir** - the /etc dir itself, locking prevents bypass via new /etc configs
+               or moving /etc; adverse side-effect is preventing password changes
+- **rootdir** - the / dir itself, locking prevents fake upgrade kernel bypass
 - **fstab** — /etc/fstab alone, given its own group because it is
   particularly painful to accidentally damage
 - **etcrare** — /etc files rarely needing changes (rc, rc.conf, login.conf,
