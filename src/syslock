@@ -242,13 +242,6 @@
 #    rejected as a combination), and reject group names containing
 #    characters outside the allowed set instead of silently truncating
 #    them (a trailing # comment is allowed).
-#    On Linux, walk directories in syslock rather than with chattr -R,
-#    passing chattr only regular files and directories: chattr -R exits
-#    1 whenever a tree holds a symlink to a directory, FIFO, socket or
-#    device, which 1.20's exit-status checking turned into a failure on
-#    every run. Paths are passed in batches; a failing batch is retried
-#    path by path so the report names the file. Audit skips the same
-#    entries (lsattr cannot read flags on them either).
 #    On Linux, audit no longer runs stat on a config path that does
 #    not exist (it printed a stat error before reporting the path as
 #    missing). Accept securelevel -1. Accept "immutable-flag: +i" on Linux, as
@@ -256,6 +249,35 @@
 #    never writes, so drop the wpath and fattr pledges and unveil listed
 #    paths r instead of rw. Treat a file whose flags cannot be read as a
 #    mismatch in audit rather than as matching.
+# Modified 12 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.20a):
+#    On Linux, walk directories in syslock rather than with chattr -R,
+#    passing chattr only regular files and directories: chattr -R exits
+#    1 whenever a tree holds a symlink to a directory, FIFO, socket or
+#    device, which 1.20's exit-status checking turned into a "Failed"
+#    report on every run. Paths are passed in batches of 200; a failing
+#    batch is retried path by path so the report names the file. Audit
+#    skips the same entries (lsattr cannot read flags on them either).
+#    Directory entries may now have any name except one containing "/"
+#    or NUL: the allowlist used to untaint them skipped (and so left
+#    unlocked) real files such as /usr/bin/[ on Linux and Proxmox's
+#    system-pve\x2dcontainer.slice. They are passed only as list-form
+#    exec arguments inside absolute paths. Names are escaped (\xNN for
+#    control characters) wherever they are printed.
+# Modified 17 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.21):
+#    Added ^ path prefix: lock or unlock the directory itself only, not
+#    its contents (chflags/chattr without -R). An immutable directory
+#    cannot have entries created, deleted or renamed in it, and cannot
+#    itself be renamed, while the files in it can still be written,
+#    and locked or unlocked by their own groups. For example, ^/etc
+#    stops new /etc/hostname.* files (which netstart runs "!" lines
+#    from before securelevel is raised) and stops /etc being moved
+#    aside and replaced. Audit checks only the directory's own flags,
+#    and the ancestor-conflict check treats ^ as covering nothing below.
+#    ! may now be combined with one other prefix, written first (!^, !=,
+#    !+, !-), so that e.g. !^/ is included in -s handling; any other
+#    combination is rejected.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -287,7 +309,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.20 of 12 October 2026';
+my $VERSION = '1.21 of 17 October 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -334,7 +356,7 @@ use constant {
 
 ### Global variables.
 
-my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %files_only, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
+my ($mode, $level, @files, $file, %dont_recurse, %dont_lock_top_level_dir, %files_only, %dir_only, %singleuser_unlocked, %group_tags, @all_group_tags, @new_group_tags, $group_tag,
     @uchg_group_tags, @schg_group_tags, @uappnd_group_tags, @sappnd_group_tags);
 
 my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
@@ -713,16 +735,22 @@ while (<$config_fh>) {
     elsif (/^group:/) {
 	die "Invalid characters in \"group:\" tag. $_\n";
     }
-    elsif (/^([\-\+!=])(.*)/) {
+    elsif (/^(![\-\+=^]|[\-\+!=^])(.*)/) {
+	# One prefix character, or ! followed by one of the others
+	# (e.g. !^/ to lock / itself and include it in -s handling).
 	$prefix_options = $1;
 	$path = $2;
+	if ($path =~ /^[\-\+!=^]/) {
+	    die "Only ! may be combined with another prefix, and it must come first (e.g. !^/path). $_\n";
+	}
 	if ($path =~ /[*?\[]/) {
 	    # Glob pattern -- expand and register each result.
 	    my @expanded = _expand_glob ($path, $prefix_options);
 	    for my $expanded_path (@expanded) {
 		$dont_lock_top_level_dir{$expanded_path} = 1 if ($prefix_options =~ /-/);
 		$dont_recurse{$expanded_path} = 1           if ($prefix_options =~ /\+/);
-		$files_only{$expanded_path} = 1             if ($prefix_options eq '=');
+		$files_only{$expanded_path} = 1             if ($prefix_options =~ /=/);
+		$dir_only{$expanded_path} = 1               if ($prefix_options =~ /\^/);
 		$singleuser_unlocked{$expanded_path} = 1    if ($prefix_options =~ /!/);
 		push (@files, $expanded_path);
 		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
@@ -739,9 +767,13 @@ while (<$config_fh>) {
 		$dont_recurse{$path} = 1;
 		print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
 	    }
-	    if ($prefix_options eq '=') {
+	    if ($prefix_options =~ /=/) {
 		$files_only{$path} = 1;
 		print "DEBUG: files_only: $path\n" if ($debug_flag);
+	    }
+	    if ($prefix_options =~ /\^/) {
+		$dir_only{$path} = 1;
+		print "DEBUG: dir_only: $path\n" if ($debug_flag);
 	    }
 	    if ($prefix_options =~ /!/) {
 		$singleuser_unlocked{$path} = 1;
@@ -1269,7 +1301,7 @@ foreach $file (@files) {
 	if ($audit_flag) {
 	    # syslock: report what is unlocked that would be locked.
 	    # sysunlock: report what is locked that would be unlocked.
-	    $any_mismatch |= _audit_file ($file, $flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file});
+	    $any_mismatch |= _audit_file ($file, $flag, $dont_recurse{$file}, $dont_lock_top_level_dir{$file}, $files_only{$file}, 0, $dir_only{$file});
 	    exit 1 if ($quiet_flag && $any_mismatch);
 	}
 	else {
@@ -1333,10 +1365,10 @@ sub _run {
 	warn "Could not run $cmd[0]: $!\n";
     }
     elsif ($? & 127) {
-	warn "$cmd[0] killed by signal " . ($? & 127) . ": @cmd\n";
+	warn "$cmd[0] killed by signal " . ($? & 127) . ": " . join (' ', map { _printable ($_) } @cmd) . "\n";
     }
     elsif ($? >> 8) {
-	warn "Failed (exit " . ($? >> 8) . "): @cmd\n";
+	warn "Failed (exit " . ($? >> 8) . "): " . join (' ', map { _printable ($_) } @cmd) . "\n";
     }
     else {
 	return 1;
@@ -1362,7 +1394,7 @@ sub _dir_entries {
     my ($dir) = @_;
     my $dh;
     unless (opendir ($dh, $dir)) {
-	warn "Cannot open directory $dir. $!\n";
+	warn "Cannot open directory " . _printable ($dir) . ". $!\n";
 	$any_failure = 1;
 	return ();
     }
@@ -1381,7 +1413,15 @@ sub _lock_or_unlock_path {
     my ($file, $flag, $verb) = @_;
 
     if (-d $file) {
-	if ($files_only{$file}) {
+	if ($dir_only{$file}) {
+	    # The directory itself only (no -R): stops entries being
+	    # created, deleted or renamed in it, and the directory being
+	    # renamed, without touching its contents.
+	    print "$verb $file (directory only)\n" if ($verbose_flag);
+	    print "DEBUG: file groups: @file_group_tags\n" if ($debug_flag);
+	    _run (@lock_command, $flag, $file);
+	}
+	elsif ($files_only{$file}) {
 	    # The directory itself and its direct file contents only,
 	    # skipping subdirectories entirely.
 	    print "$verb $file (files only)\n" if ($verbose_flag);
@@ -1441,18 +1481,29 @@ sub _lock_or_unlock_path {
     }
 }
 
-# Untaint a directory entry. Returns the untainted name, or warns and
-# returns undef if it contains characters outside our safe set, so an
-# admin knows a listed file was not actually processed.
-# NOTE: This accepts ( ) and & which are still rejected for
-# config-supplied paths in _file_warnings and _expand_glob. If
-# changed for consistency the recommendation would be to remove them
-# from here and not add them there.
+# Untaint a directory entry. Any name is accepted except one containing
+# "/" or NUL, which readdir cannot return. This is safe because every
+# entry reaches chflags/chattr/ls/lsattr only as one element of a
+# list-form exec (no shell), inside an absolute path (so it can never be
+# read as an option). An allowlist here skipped real system files --
+# /usr/bin/[ on Linux, systemd's "system-pve\x2dcontainer.slice" -- and
+# left them unlocked. Names are passed through _printable() wherever
+# they are printed. (Paths in the config file itself are still held to
+# the stricter rules in _file_warnings and _expand_glob.)
 sub _untaint_entry {
     my ($dir, $entry, $no_warn) = @_;
-    return $1 if $entry =~ /\A([-\w.+ ,()~!@#%^&=]+)\z/;
-    warn "Warning: skipping \"$dir/$entry\": filename contains characters outside the safe set; not processed.\n" unless $no_warn;
+    return $1 if $entry =~ /\A([^\/\0]+)\z/s;
+    warn "Warning: skipping \"" . _printable ("$dir/$entry") . "\": invalid directory entry; not processed.\n" unless $no_warn;
     return undef;
+}
+
+# Return a string safe to print: control characters (including
+# newline and escape) and DEL are shown as \xNN, so a file name cannot
+# inject terminal escape sequences or fake lines into output or mail.
+sub _printable {
+    my ($str) = @_;
+    $str =~ s/([\x00-\x1f\x7f])/sprintf ("\\x%02x", ord ($1))/ge;
+    return $str;
 }
 
 # Subroutine to detect ancestor/descendant conflicts: cases where the same
@@ -1493,7 +1544,11 @@ sub _check_ancestor_conflicts {
             my $would_process = 0;
             my $is_direct_child = ($file =~ m{^\Q$ancestor\E/[^/]+$});
 
-            if ($files_only{$ancestor}) {
+            if ($dir_only{$ancestor}) {
+                # ^ prefix: only the directory itself.
+                $would_process = 0;
+            }
+            elsif ($files_only{$ancestor}) {
                 # = prefix: only direct non-directory children.
                 $would_process = ($is_direct_child && !-d $file);
             }
@@ -1600,7 +1655,7 @@ sub _file_warnings {
 	_note ("Warning: File path in config is a symlink. $clean_path\n");
     }
     # Warn if a directory-only prefix (+, -, =) is used on a non-directory path.
-    if (defined $prefix_options && $prefix_options =~ /[-+=]/ && -e $clean_path && !-d $clean_path) {
+    if (defined $prefix_options && $prefix_options =~ /[-+=^]/ && -e $clean_path && !-d $clean_path) {
 	_note ("Warning: prefix '$prefix_options' has no effect on non-directory path $clean_path\n");
     }
     # For non-root BSD users, warn if the file is not owned by the invoking user.
@@ -1905,7 +1960,7 @@ sub _run_batched {
 # (This currently only looks at the specific flag for BSD, schg/uchg/uappnd,
 # and will call it "unlocked" if it's only locked with the one not checked.)
 sub _audit_file {
-    my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $files_only_flag, $recurse_level) = @_;
+    my ($file, $desired_flag, $dont_recurse_flag, $dont_lock_top_level_dir_flag, $files_only_flag, $recurse_level, $dir_only_flag) = @_;
     my ($flags, $desired_state, @subfiles, $subfile, $printed_something, $spaces);
     my $found_mismatch = 0;
 
@@ -1937,31 +1992,34 @@ sub _audit_file {
     }
 
     $recurse_level = 0 if (!defined ($recurse_level));
+    my $show = _printable ($file); # for output only
 
     $printed_something = 0;
     $spaces = $recurse_level * 3;
 
     if (-l $file || -c $file) {
-	print "Warning: ignoring symlink. $file\n" if (-l $file && !$quiet_flag);
-	print "Warning: ignoring special character file. $file\n" if (-c $file && !$quiet_flag);
+	print "Warning: ignoring symlink. $show\n" if (-l $file && !$quiet_flag);
+	print "Warning: ignoring special character file. $show\n" if (-c $file && !$quiet_flag);
     }
     elsif ($linux && -e $file && !_flaggable ($file)) {
 	# FIFO, socket or block device: lsattr cannot read flags on it.
-	print "Warning: ignoring special file (not a regular file or directory). $file\n" unless $quiet_flag;
+	print "Warning: ignoring special file (not a regular file or directory). $show\n" unless $quiet_flag;
     }
     elsif ($linux && (_on_nonstd_fs ($file))) {
-	print "Warning: ignoring file on non-standard mounted filesystem. $file\n" unless $quiet_flag;
+	print "Warning: ignoring file on non-standard mounted filesystem. $show\n" unless $quiet_flag;
     }
     elsif (-d $file) {
 	# We care about the dir itself.
 	if (!$dont_lock_top_level_dir_flag) {
 	    if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
-		print ' 'x$spaces, "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
+		print ' 'x$spaces, "$show (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 		$printed_something = 1;
 		$found_mismatch = 1;
 		return $found_mismatch if $quiet_flag;
 	    }
 	}
+	# ^ prefix: only the directory itself is managed.
+	return $found_mismatch if ($dir_only_flag);
 	# Check subdir contents.
 	opendir (my $dir_fh, $file) || die "Cannot open directory. $!. $file\n";
 	@subfiles = grep (!/^\.{1,2}$/, readdir ($dir_fh));
@@ -2003,10 +2061,10 @@ sub _audit_file {
 	    elsif (-e "$file/$subfile" &&
 		   ($flags = _desired_flag_mismatch ("$file/$subfile", $desired_flag))) {
 		if (!$printed_something && !$quiet_flag) {
-		    print ' 'x$spaces, "In $file/:\n";
+		    print ' 'x$spaces, "In $show/:\n";
 		    $printed_something = 1;
 		}
-		print ' 'x$spaces, "   $subfile (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
+		print ' 'x$spaces, "   ${\ _printable ($subfile)} (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 		$found_mismatch = 1;
 		return $found_mismatch if $quiet_flag;
 	    }
@@ -2015,14 +2073,14 @@ sub _audit_file {
     # If a file, just audit the file.
     elsif (-e $file) {
 	if ($flags = _desired_flag_mismatch ($file, $desired_flag)) {
-	    print "$file (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
+	    print "$show (should be $desired_state, flags=$flags)\n" unless $quiet_flag;
 	    $found_mismatch = 1;
 	    return $found_mismatch if $quiet_flag;
 	}
     }
     # If nonexistent, just report that.
     else {
-	print "File path in config inaccessible or does not exist. $!. $file\n" unless $quiet_flag;
+	print "File path in config inaccessible or does not exist. $!. $show\n" unless $quiet_flag;
 	# A nonexistent file is not a flag mismatch per se; don't count as mismatch.
     }
 
