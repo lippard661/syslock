@@ -278,6 +278,16 @@
 #    ! may now be combined with one other prefix, written first (!^, !=,
 #    !+, !-), so that e.g. !^/ is included in -s handling; any other
 #    combination is rejected.
+# Modified 20 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.21a):
+#    A path may now be managed by only one config entry. Previously a
+#    second entry for the same path silently replaced the first one's
+#    group tags (the last entry won), so e.g. a file also listed by
+#    mistake under another group dropped out of its real group. Now the
+#    same path listed explicitly twice, or matched by two different
+#    globs, is a config error naming both lines; a path listed
+#    explicitly and also matched by a glob uses the explicit entry,
+#    whichever comes first. Each path is also processed only once.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -309,7 +319,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.21 of 17 October 2026';
+my $VERSION = '1.21a of 20 October 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -382,6 +392,11 @@ my ($config_file, $bsd, $linux, @lock_command, $lock_flag, $unlock_flag,
     $waiting_on_libs, $start_time, $reason,
     $force_flag, $audit_flag, $quiet_flag, $operational_flag);
 my ($temp_lock_flag, $temp_unlock_flag);
+
+# Where each config path came from, for duplicate detection in
+# _register_path: line number of an explicit entry, or [line, pattern]
+# for a path matched by a glob.
+my (%explicit_line, %glob_source);
 
 # Set when any chflags/chattr/mount command fails or a directory cannot
 # be read; makes the script exit 1.
@@ -745,57 +760,26 @@ while (<$config_fh>) {
 	}
 	if ($path =~ /[*?\[]/) {
 	    # Glob pattern -- expand and register each result.
-	    my @expanded = _expand_glob ($path, $prefix_options);
-	    for my $expanded_path (@expanded) {
-		$dont_lock_top_level_dir{$expanded_path} = 1 if ($prefix_options =~ /-/);
-		$dont_recurse{$expanded_path} = 1           if ($prefix_options =~ /\+/);
-		$files_only{$expanded_path} = 1             if ($prefix_options =~ /=/);
-		$dir_only{$expanded_path} = 1               if ($prefix_options =~ /\^/);
-		$singleuser_unlocked{$expanded_path} = 1    if ($prefix_options =~ /!/);
-		push (@files, $expanded_path);
-		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
+	    foreach my $expanded_path (_expand_glob ($path, $prefix_options)) {
+		_register_path ($expanded_path, $prefix_options, $path);
 	    }
 	}
 	else {
 	    $path = _file_warnings ($path, $prefix_options); # get untainted path back
-	    
-	    if ($prefix_options =~ /-/) {
-		$dont_lock_top_level_dir{$path} = 1;
-		print "DEBUG: dont_lock_top_level_dir: $path\n" if ($debug_flag);
-	    }
-	    if ($prefix_options =~ /\+/) {
-		$dont_recurse{$path} = 1;
-		print "DEBUG: dont_recurse: $path\n" if ($debug_flag);
-	    }
-	    if ($prefix_options =~ /=/) {
-		$files_only{$path} = 1;
-		print "DEBUG: files_only: $path\n" if ($debug_flag);
-	    }
-	    if ($prefix_options =~ /\^/) {
-		$dir_only{$path} = 1;
-		print "DEBUG: dir_only: $path\n" if ($debug_flag);
-	    }
-	    if ($prefix_options =~ /!/) {
-		$singleuser_unlocked{$path} = 1;
-		print "DEBUG: singleuser_unlocked: $path\n" if ($debug_flag);
-	    }
-	    push (@files, $path);
-	    $group_tags{$path} = $current_group_tags if ($current_group_tags);
+	    _register_path ($path, $prefix_options);
 	}
     }
     else {
 	if ($_ =~ /[*?\[]/) {
 	    # Glob pattern -- expand and register each result.
-	    my @expanded = _expand_glob ($_, '');
-	    for my $expanded_path (@expanded) {
-		push (@files, $expanded_path);
-		$group_tags{$expanded_path} = $current_group_tags if ($current_group_tags);
+	    my $pattern = $_;
+	    foreach my $expanded_path (_expand_glob ($pattern, '')) {
+		_register_path ($expanded_path, '', $pattern);
 	    }
 	}
 	else {
 	    $path = _file_warnings ($_);
-	    push (@files, $path);
-	    $group_tags{$path} = $current_group_tags if ($current_group_tags);
+	    _register_path ($path, '');
 	}
     }
 }
@@ -1349,6 +1333,63 @@ sub _effective_flag_type {
 }
 
 ### Subroutines.
+
+# Register one path from the config file (line $.), with its prefix and
+# the current group tags. $pattern is the glob it came from, if any.
+# Each path is managed by exactly one entry, since a second entry would
+# silently replace the first one's groups:
+#   - the same path listed explicitly twice is an error;
+#   - a path listed explicitly and also matched by a glob uses the
+#     explicit entry, whichever comes first in the file (so e.g.
+#     /etc/hostname.* can sit alongside an explicit /etc/hostname.igc0
+#     with extra groups);
+#   - a path matched by two different globs is an error.
+sub _register_path {
+    my ($path, $prefix, $pattern) = @_;
+    my $line = $.;
+    my $replacing = 0;
+
+    if (defined ($pattern)) {
+	if (exists ($explicit_line{$path})) {
+	    print "DEBUG: $path matched by $pattern (line $line) is listed explicitly on line $explicit_line{$path}; using that entry\n" if ($debug_flag);
+	    return;
+	}
+	if (exists ($glob_source{$path})) {
+	    my ($other_line, $other_pattern) = @{$glob_source{$path}};
+	    die "Config file: $path is matched by both $other_pattern (line $other_line) and $pattern (line $line); list it explicitly to choose its groups.\n";
+	}
+	$glob_source{$path} = [ $line, $pattern ];
+    }
+    else {
+	if (exists ($explicit_line{$path})) {
+	    die "Config file: $path is listed twice (lines $explicit_line{$path} and $line); each path may appear only once.\n";
+	}
+	$explicit_line{$path} = $line;
+	if (exists ($glob_source{$path})) {
+	    # An earlier glob matched it: this entry replaces that one.
+	    print "DEBUG: $path listed explicitly on line $line replaces its match by $glob_source{$path}[1] (line $glob_source{$path}[0])\n" if ($debug_flag);
+	    delete ($glob_source{$path});
+	    delete ($_->{$path}) foreach (\%dont_lock_top_level_dir, \%dont_recurse,
+					   \%files_only, \%dir_only, \%singleuser_unlocked);
+	    $replacing = 1;
+	}
+    }
+
+    $dont_lock_top_level_dir{$path} = 1 if ($prefix =~ /-/);
+    $dont_recurse{$path} = 1            if ($prefix =~ /\+/);
+    $files_only{$path} = 1              if ($prefix =~ /=/);
+    $dir_only{$path} = 1                if ($prefix =~ /\^/);
+    $singleuser_unlocked{$path} = 1     if ($prefix =~ /!/);
+    print "DEBUG: prefix '$prefix': $path\n" if ($debug_flag && $prefix ne '');
+
+    push (@files, $path) unless ($replacing); # keeps its first position
+    if ($current_group_tags) {
+	$group_tags{$path} = $current_group_tags;
+    }
+    else {
+	delete ($group_tags{$path});
+    }
+}
 
 # Print a config-parse warning, unless -q (quiet) was given.
 sub _note {
