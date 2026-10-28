@@ -288,6 +288,14 @@
 #    globs, is a config error naming both lines; a path listed
 #    explicitly and also matched by a glob uses the explicit entry,
 #    whichever comes first. Each path is also processed only once.
+# Modified 28 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.21b):
+#    Globs in the config no longer match symlinks (as they already did
+#    not match directories); a symlink listed explicitly is handled as
+#    before. With -g, config warnings (missing files, globs matching
+#    nothing, ancestor-conflict notes) are only printed for entries in
+#    the selected group, so e.g. the hourly sysunlock/syslock -g
+#    newsyslog-logs runs no longer report on unrelated groups.
 #
 # Note for OpenBSD:
 #    File paths beginning with a ! will be locked or unlocked when -s
@@ -319,7 +327,7 @@ BEGIN {
 
 my $DEFAULT_CONFIG_FILE = '/etc/syslock.conf';
 
-my $VERSION = '1.21a of 20 October 2026';
+my $VERSION = '1.21b of 28 October 2026';
 
 my $LOCK = 0;
 my $UNLOCK = 1;
@@ -397,6 +405,10 @@ my ($temp_lock_flag, $temp_unlock_flag);
 # _register_path: line number of an explicit entry, or [line, pattern]
 # for a path matched by a glob.
 my (%explicit_line, %glob_source);
+
+# Config warnings held until the selected group is known (see _note).
+my @deferred_notes;
+my $notes_flushed = 0;
 
 # Set when any chflags/chattr/mount command fails or a directory cannot
 # be read; makes the script exit 1.
@@ -811,18 +823,6 @@ $sappnd_group_in_use_flag = 0;
 my $global_lock_flag   = $lock_flag;
 my $global_unlock_flag = $unlock_flag;
 
-# Check for ancestor/descendant conflicts where the same file path could
-# be processed by two different groups using different flag types.
-# Only meaningful on BSD where multiple flag types exist.
-{
-    my %flag_types_in_use;
-    $flag_types_in_use{$lock_flag} = 1;
-    $flag_types_in_use{$BSD_SYS_IMMUTABLE_FLAG_ON}  = 1 if $schg_group_flag;
-    $flag_types_in_use{$BSD_USER_IMMUTABLE_FLAG_ON} = 1 if $uchg_group_flag;
-    $flag_types_in_use{$BSD_SYS_APPEND_FLAG_ON}     = 1 if $sappnd_group_flag;
-    $flag_types_in_use{$BSD_USER_APPEND_FLAG_ON}    = 1 if $uappnd_group_flag;
-    _check_ancestor_conflicts() if ($bsd && keys %flag_types_in_use > 1);
-}
 
 # Make sure specified group tag exists.
 #
@@ -967,6 +967,36 @@ if ($specified_group_tag) {
 	die "Specified group tag \"$specified_group_tag\" doesn't exist.\n";
     }
 }
+
+# Check for ancestor/descendant conflicts where the same file path could
+# be processed by two different groups using different flag types.
+# Only meaningful on BSD where multiple flag types exist. (Run after the
+# -g handling above so its warnings can be limited to the selected group;
+# uses the global flag, which that handling may have changed for -g.)
+{
+    my %flag_types_in_use;
+    $flag_types_in_use{$global_lock_flag} = 1;
+    $flag_types_in_use{$BSD_SYS_IMMUTABLE_FLAG_ON}  = 1 if $schg_group_flag;
+    $flag_types_in_use{$BSD_USER_IMMUTABLE_FLAG_ON} = 1 if $uchg_group_flag;
+    $flag_types_in_use{$BSD_SYS_APPEND_FLAG_ON}     = 1 if $sappnd_group_flag;
+    $flag_types_in_use{$BSD_USER_APPEND_FLAG_ON}    = 1 if $uappnd_group_flag;
+    _check_ancestor_conflicts() if ($bsd && keys %flag_types_in_use > 1);
+}
+
+# Print the config warnings collected so far. With -g, only those for
+# entries in the selected group, so a run for one group does not report
+# on unrelated parts of the config (e.g. every hourly -g newsyslog-logs
+# run warning about other groups' missing files).
+foreach my $note (@deferred_notes) {
+    my ($tags, $msg) = @$note;
+    next if ($specified_group_tag &&
+	     !_in_group ($specified_group_tag, $uchg_group_specified_flag,
+			 $schg_group_specified_flag, $sappnd_group_specified_flag,
+			 split (/\s+/, $tags)));
+    print $msg unless $quiet_flag;
+}
+@deferred_notes = ();
+$notes_flushed = 1;
 
 # Get system security level if BSD, using BSD_SYS_IMMUTABLE_FLAG_ON, or
 # there are schg or sappnd groups. Non-root users are restricted to
@@ -1391,9 +1421,19 @@ sub _register_path {
     }
 }
 
-# Print a config-parse warning, unless -q (quiet) was given.
+# Report a config warning. $tags are the group tags of the entry it is
+# about (default: the group: line being parsed). Until the -g handling
+# is done, warnings are held so that only those for entries in the
+# selected group are printed; -q (quiet) suppresses them all.
 sub _note {
-    print @_ unless $quiet_flag;
+    my ($msg, $tags) = @_;
+    $tags = $current_group_tags unless (defined ($tags));
+    if ($notes_flushed) {
+	print $msg unless $quiet_flag;
+    }
+    else {
+	push (@deferred_notes, [ $tags || '', $msg ]);
+    }
 }
 
 # Run a command without a shell. Returns 1 on success. On failure,
@@ -1564,7 +1604,7 @@ sub _check_ancestor_conflicts {
     for my $file (@files) {
         # Skip symlinks -- ancestor detection through symlinks is unreliable.
         if (-l $file) {
-            _note ("Warning: $file is a symlink; ancestor conflict check skipped.\n");
+            _note ("Warning: $file is a symlink; ancestor conflict check skipped.\n", $group_tags{$file});
             next;
         }
 
@@ -1609,7 +1649,7 @@ sub _check_ancestor_conflicts {
             if ($would_process) {
                 _note ("Warning: $file (flag type: $file_flag) would also be " .
                       "processed by ancestor $ancestor (flag type: $ancestor_flag). " .
-                      "Both flags could be set on the same path.\n");
+                      "Both flags could be set on the same path.\n", $group_tags{$file});
             }
         }
     }
@@ -1790,6 +1830,13 @@ sub _expand_glob {
 
     # Validate and untaint each expanded path via _file_warnings.
     for my $match (@matches) {
+        # Skip symlinks: a glob matching one (e.g. access.log.yesterday
+        # pointing at a rotated log) is rarely meant, and chflags would
+        # act on the link's target. List a symlink explicitly to manage it.
+        if (-l $match) {
+            print "DEBUG: glob $full_pattern matched symlink $match; skipping\n" if ($debug_flag);
+            next;
+        }
         # Skip directories when glob is used (directories should be listed
         # explicitly to make the recursion/no-recursion intent clear).
         if (-d $match) {

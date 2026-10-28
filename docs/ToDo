@@ -1,3 +1,6 @@
+(Fixed 1.21b) Globs no longer match symlinks, -g warnings will
+only be displayed for the parts of the config being touched.
+
 (Fixed 1.21a) If an explicit path appears more than once in a config,
 identify that as an error and abort. If a glob and an explicit path
 matching the glob are both in the same config file, the explicit path
